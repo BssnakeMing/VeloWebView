@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VeloWebView Test</title>
+  <style>body{font-family:sans-serif;background:#20242b;color:#f4f4f4;padding:24px}button{padding:8px 12px;margin-right:8px}video{display:block;width:min(640px,100%);margin-top:16px;background:#000}textarea,input{display:block;width:min(640px,100%);box-sizing:border-box;margin-top:12px;padding:8px}</style>
+</head>
+<body>
+  <h1>VeloWebView Test</h1>
+  <p id="status">Bridge not called yet.</p>
+  <button onclick="testUE()">Send Message To UE</button>
+  <button onclick="sendJSON()">Send JSON</button>
+  <p><a href="https://example.com/">Same-view link</a> |
+    <a href="https://example.com/?new-window=1" target="_blank">New-window link</a></p>
+  <button onclick="window.open('https://example.com/?window-open=1', '_blank')">window.open link</button>
+  <video controls autoplay muted playsinline preload="metadata">
+    <!-- Set a product-owned MP4/HLS source here when testing media. -->
+  </video>
+  <input type="text" placeholder="input / soft keyboard test">
+  <textarea rows="4" placeholder="textarea test"></textarea>
+  <script>
+    function post(value) {
+      if (window.VeloWebView && window.VeloWebView.postMessage) {
+        window.VeloWebView.postMessage(value);
+        document.getElementById('status').textContent = 'Sent: ' + value;
+      } else {
+        document.getElementById('status').textContent = 'Bridge unavailable';
+      }
+    }
+    function testUE(){ post('hello from VeloWebView test page'); }
+    function sendJSON(){ post(JSON.stringify({event:'VideoStarted',videoId:'10086'})); }
+  </script>
+</body>
+</html>

@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- VeloWebView Android packaging and GameActivity lifecycle hooks. -->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+	<init>
+		<log text="VeloWebView Android integration" />
+		<setBool result="bVeloWebViewSupported" value="true" />
+	</init>
+
+	<androidManifestUpdates>
+		<addPermission android:name="android.permission.INTERNET" />
+		<addPermission android:name="android.permission.ACCESS_NETWORK_STATE" />
+		<!-- These permissions are only granted after an explicit WebView/UE
+		     permission decision and Android runtime permission grant. -->
+		<addPermission android:name="android.permission.CAMERA" />
+		<addPermission android:name="android.permission.RECORD_AUDIO" />
+		<addPermission android:name="android.permission.ACCESS_FINE_LOCATION" />
+		<addPermission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+		<!-- Unknown permissions are ignored by pre-33 devices; the permission is
+		     requested only when WebView asks for notifications on API 33+. -->
+		<addPermission android:name="android.permission.POST_NOTIFICATIONS" />
+	</androidManifestUpdates>
+
+	<!-- Java classes are copied into the generated Gradle project. -->
+	<resourceCopies>
+		<copyDir src="$S(PluginDir)/../Java" dst="$S(BuildDir)" />
+	</resourceCopies>
+
+	<proguardAdditions>
+		<insert>
+-keep class com.velowebview.VeloWebViewManager { public *; }
+-keep class com.velowebview.VeloWebViewManager$* { public *; }
+-keepclassmembers class com.velowebview.VeloWebViewManager {
+    native &lt;methods&gt;;
+}
+		</insert>
+	</proguardAdditions>
+
+	<gameActivityImportAdditions>
+		<insert>
+			import com.velowebview.VeloWebViewManager;
+		</insert>
+	</gameActivityImportAdditions>
+
+	<gameActivityClassAdditions>
+		<insert>
+		@Override
+		public void onBackPressed()
+		{
+			if (VeloWebViewManager.handleBackPressed())
+			{
+				return;
+			}
+			super.onBackPressed();
+		}
+		</insert>
+	</gameActivityClassAdditions>
+
+	<gameActivityOnCreateAdditions>
+		<insert>
+			VeloWebViewManager.initialize(this);
+		</insert>
+	</gameActivityOnCreateAdditions>
+
+	<gameActivityOnDestroyAdditions>
+		<insert>
+			VeloWebViewManager.onActivityDestroyed();
+		</insert>
+	</gameActivityOnDestroyAdditions>
+
+	<gameActivityOnPauseAdditions>
+		<insert>
+			VeloWebViewManager.onActivityPause();
+		</insert>
+	</gameActivityOnPauseAdditions>
+
+	<gameActivityOnResumeAdditions>
+		<insert>
+			VeloWebViewManager.onActivityResume();
+		</insert>
+	</gameActivityOnResumeAdditions>
+
+	<gameActivityOnRequestPermissionsResultAdditions>
+		<insert>
+			VeloWebViewManager.onRequestPermissionsResult(requestCode, permissions, grantResults);
+		</insert>
+	</gameActivityOnRequestPermissionsResultAdditions>
+</root>

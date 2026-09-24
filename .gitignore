@@ -1,0 +1,11 @@
+# Unreal Engine generated files
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+
+# IDE and project files
+*.sln
+*.suo
+*.user
