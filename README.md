@@ -38,6 +38,22 @@ Android keeps the engine WebBrowser implementation. Run
 `Scripts/SetupCEF.ps1` to download the pinned CEF 154 Windows x64 package; the
 runtime is intentionally kept out of Git.
 
+### CEF runtime download
+
+The source repository keeps the large CEF distribution out of Git. For a
+ready-to-use Windows package, download the CEF 154 archive from the project
+share and extract it into the plugin's `ThirdParty/CEF` directory (or follow
+the archive's included layout):
+
+- [CEF_154.0.32_g682c378_chromium-154.0.8037.58_windows64_UE_WebBrowser.zip](https://1823780428.share.123pan.cn/123pan/MRgYjv-vIFOH?pwd=9lfo)
+- 123 云盘提取码：`9lfo`
+
+The compiled `VeloWebView-1.0.0-Win64.zip` package is published on the
+GitHub Releases page. It contains the packaged plugin and its Win64 runtime;
+the external CEF archive is also provided for source builds and repackaging.
+See [`Docs/CEF_DOWNLOAD.md`](Docs/CEF_DOWNLOAD.md) for the expected layout and
+license notes.
+
 ## Windows WebView2 dependency
 
 Native Overlay mode uses the official Microsoft WebView2 SDK. The SDK was
