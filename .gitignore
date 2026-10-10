@@ -9,3 +9,15 @@ DerivedDataCache/
 *.sln
 *.suo
 *.user
+
+# CEF is downloaded during setup; do not commit the 170+ MB runtime. Keep the
+# small manifest so a packaged project can record the exact runtime checksum.
+ThirdParty/CEF/*
+!ThirdParty/CEF/CEF_VERSION.json
+BrowserHost/build*/
+BrowserHost/out/
+BrowserHost/*.exe
+BrowserHost/*.dll
+
+# Local runtime/test logs
+*.log

@@ -46,6 +46,14 @@ enum class EVeloWebViewNewWindowPolicy : uint8
 	Block          = 3 UMETA(DisplayName = "Block")
 };
 
+/** Browser presentation and UMG stacking behavior. */
+UENUM(BlueprintType)
+enum class EVeloWebViewRenderMode : uint8
+{
+	Composited UMETA(DisplayName = "Composited With UMG"),
+	NativeOverlay UMETA(DisplayName = "Native Overlay")
+};
+
 /** Structured navigation/runtime error delivered to Blueprint. */
 USTRUCT(BlueprintType)
 struct VELOWEBVIEW_API FVeloWebViewError

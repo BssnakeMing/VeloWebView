@@ -3,7 +3,7 @@
 	"Version": 1,
 	"VersionName": "1.0",
 	"FriendlyName": "VeloWebView",
-	"Description": "Native GPU-composited WebView2/Android WebView widget for UMG.",
+	"Description": "UMG-composited or native WebView widget for Windows and Android.",
 	"Category": "UI",
 	"CreatedBy": "VeloWebView",
 	"CreatedByURL": "",
@@ -19,6 +19,9 @@
 	"IsExperimentalVersion": false,
 	"Installed": false,
 	"EnabledByDefault": true,
+	"Plugins": [
+		{ "Name": "WebBrowserWidget", "Enabled": true, "PlatformAllowList": ["Android"] }
+	],
 	"Modules": [
 		{
 			"Name": "VeloWebView",

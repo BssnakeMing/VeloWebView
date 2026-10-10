@@ -4,6 +4,7 @@
 
 #include "HAL/PlatformProcess.h"
 #include "Misc/ScopeLock.h"
+#include "Android/AndroidWindow.h"
 
 namespace VeloWebViewAndroidPrivate
 {
@@ -190,13 +191,33 @@ namespace VeloWebViewAndroidPrivate
 		virtual void SetGeometry(const FIntRect& ScreenRect, float Scale) override
 		{
 			if (InstanceId <= 0) return;
-			const float Width = FMath::Max(0, ScreenRect.Width());
-			const float Height = FMath::Max(0, ScreenRect.Height());
-			// Slate's absolute geometry is already in viewport pixels on Android;
-			// the bridge accepts physical pixels (and has an explicit dp mode for
-			// callers that need it), so do not multiply by Android density here.
+			(void)Scale;
+			// UE may render Slate at a reduced mobile resolution (for example
+			// 1280x720 on a 1920x1080 SurfaceView). Android View bounds use the
+			// physical SurfaceView size, so map both axes independently. Density
+			// is unrelated to this render-resolution scale.
+			const FPlatformRect LogicalScreen = FAndroidWindow::GetScreenRect();
+			int32 SurfaceWidth = 0;
+			int32 SurfaceHeight = 0;
+			FAndroidWindow::CalculateSurfaceSize(SurfaceWidth, SurfaceHeight);
+			const int32 LogicalWidth = LogicalScreen.Right - LogicalScreen.Left;
+			const int32 LogicalHeight = LogicalScreen.Bottom - LogicalScreen.Top;
+			if (LogicalWidth <= 0 || LogicalHeight <= 0 || SurfaceWidth <= 0 || SurfaceHeight <= 0) return;
+
+			const float ScaleX = static_cast<float>(SurfaceWidth) / LogicalWidth;
+			const float ScaleY = static_cast<float>(SurfaceHeight) / LogicalHeight;
+			const FIntRect NativeRect(
+				FMath::RoundToInt((ScreenRect.Min.X - LogicalScreen.Left) * ScaleX),
+				FMath::RoundToInt((ScreenRect.Min.Y - LogicalScreen.Top) * ScaleY),
+				FMath::RoundToInt((ScreenRect.Max.X - LogicalScreen.Left) * ScaleX),
+				FMath::RoundToInt((ScreenRect.Max.Y - LogicalScreen.Top) * ScaleY));
+			if (bHasNativeBounds && NativeRect == LastNativeBounds) return;
+			bHasNativeBounds = true;
+			LastNativeBounds = NativeRect;
 			FVeloWebViewAndroidBridge::SetBounds(InstanceId,
-				static_cast<float>(ScreenRect.Min.X), static_cast<float>(ScreenRect.Min.Y), Width, Height, false);
+				static_cast<float>(NativeRect.Min.X), static_cast<float>(NativeRect.Min.Y),
+				static_cast<float>(FMath::Max(0, NativeRect.Width())),
+				static_cast<float>(FMath::Max(0, NativeRect.Height())), false);
 		}
 
 		virtual void SetVisibility(bool bVisible) override { FVeloWebViewAndroidBridge::SetVisibility(InstanceId, bVisible); }
@@ -254,6 +275,8 @@ namespace VeloWebViewAndroidPrivate
 		FString CurrentTitle;
 		FVeloWebViewPlatformCreateParams Params;
 		FVeloWebViewPlatformCallbacks Callbacks;
+		FIntRect LastNativeBounds;
+		bool bHasNativeBounds = false;
 		TMap<EVeloWebViewPermission, int32> PendingPermissionTokens;
 	};
 

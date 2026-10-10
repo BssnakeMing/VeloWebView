@@ -3,10 +3,16 @@
 #include "CoreMinimal.h"
 #include "Components/Widget.h"
 #include "VeloWebViewTypes.h"
+#include "VeloWebViewCEFConnection.h"
 #include "VeloWebView.generated.h"
 
 class SVeloWebView;
 class IVeloWebViewPlatform;
+class UVeloWebViewScriptBridge;
+class UTexture2D;
+#if PLATFORM_ANDROID
+class SWebBrowserView;
+#endif
 
 DECLARE_LOG_CATEGORY_EXTERN(LogVeloWebView, Log, All);
 
@@ -23,11 +29,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVeloWebViewFullscreenChanged, bool,
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVeloWebViewBeforeNavigate, const FString&, URL);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVeloWebViewNewWindowRequested, const FString&, URL, bool, bIsUserInitiated);
 
-/**
- * High-performance native WebView hosted by UMG. The widget deliberately keeps
- * platform details out of Blueprint; Windows uses WebView2 composition and
- * Android uses a native WebView overlay.
- */
+/** WebView hosted by UMG with a composited or native presentation mode. */
 UCLASS(BlueprintType, meta = (DisplayName = "Velo Web View"))
 class VELOWEBVIEW_API UVeloWebView : public UWidget
 {
@@ -41,6 +43,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView")
 	FString InitialURL;
 
+	/** Composited participates in UMG ZOrder. NativeOverlay keeps the platform browser above UE UI. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "VeloWebView|Rendering")
+	EVeloWebViewRenderMode RenderMode = EVeloWebViewRenderMode::Composited;
+
+	/** Pixel density for the Windows Composited surface. 1.0 is native physical resolution. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView|Rendering", meta = (ClampMin = "0.5", ClampMax = "2.0"))
+	float CompositedResolutionScale = 1.0f;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView")
 	bool bEnableJavaScript = true;
 
@@ -49,6 +59,14 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView")
 	bool bMuted = false;
+
+	/** Allow trusted pages to request camera/microphone for WebRTC Pixel Streaming. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView|WebRTC")
+	bool bAllowMediaCapture = false;
+
+	/** Keep trusted WebRTC Pixel Streaming pages active when the widget is backgrounded. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView|WebRTC")
+	bool bEnablePixelStreaming = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VeloWebView")
 	bool bTransparentBackground = false;
@@ -97,6 +115,13 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "VeloWebView")
 	void LoadHTML(const FString& HTML, const FString& BaseURL);
 
+	/**
+	 * Loads the plugin's Content/Host.html template and sets its initial iframe
+	 * URL. The host page exposes window.VeloHost for later URL changes.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|Host")
+	bool LoadHostHTML(const FString& InitialIframeURL);
+
 	UFUNCTION(BlueprintCallable, Category = "VeloWebView")
 	void Reload();
 	
@@ -117,6 +142,18 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
 	void ExecuteJavaScript(const FString& Script);
+
+	/**
+	 * Updates the iframe owned by Content/Host.html.  This is a convenience
+	 * wrapper around ExecuteJavaScript and is safe to call from Blueprint after
+	 * the host page has loaded.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|Host")
+	void SetHostIframeURL(const FString& URL);
+
+	/** Requests the Host.html iframe to reload its current URL. */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|Host")
+	void RefreshHostIframe();
 
 	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
 	void SetJavaScriptEnabled(bool bEnabled);
@@ -188,6 +225,7 @@ public:
 
 private:
 	friend class SVeloWebView;
+	friend class UVeloWebViewScriptBridge;
 
 	void HandlePageStarted(const FString& URL);
 	void HandlePageLoaded(const FString& URL);
@@ -203,13 +241,47 @@ private:
 	void HandleNewWindowRequested(const FString& URL, bool bIsUserInitiated);
 
 	void EnsurePlatform();
+	#if PLATFORM_ANDROID
+	TSharedPtr<SWebBrowserView> GetCompositedBrowser() const;
+	bool FlushPendingCompositedNavigation();
+	#endif
+	void EnsureCompositedCEF(FIntPoint InitialSize = FIntPoint::ZeroValue);
+	void UpdateCompositedCEFFrame(const TArray<uint8>& Pixels, const FIntPoint& Size, uint64 Sequence);
+	UTexture2D* GetCompositedCEFTexture() const { return CompositedTexture; }
 	void QueueOrExecute(TFunction<void(IVeloWebViewPlatform&)> Action);
 
 	TSharedPtr<SVeloWebView> MyWebViewWidget;
 	TSharedPtr<IVeloWebViewPlatform> Platform;
+	UPROPERTY(Transient)
+	TObjectPtr<UVeloWebViewScriptBridge> ScriptBridge;
 	FString PendingURL;
 	FString PendingHTML;
 	FString PendingBaseURL;
 	bool bPendingHTML = false;
+	#if PLATFORM_ANDROID
+	bool bCompositedInitialized = false;
+	#endif
+	TSharedPtr<FVeloCEFConnection> CEFConnection;
+	UPROPERTY(Transient)
+	TObjectPtr<UTexture2D> CompositedTexture;
+	FIntPoint CompositedTextureSize = FIntPoint::ZeroValue;
+	uint64 CompositedTextureSequence = 0;
 	bool bRequestedVisibility = true;
+	TMap<FString, TMap<FString, FString>> CompositedCookieCache;
+};
+
+/** JS message endpoint used by the Slate-composited browser. */
+UCLASS()
+class VELOWEBVIEW_API UVeloWebViewScriptBridge : public UObject
+{
+	GENERATED_BODY()
+
+public:
+	void SetOwner(UVeloWebView* InOwner) { Owner = InOwner; }
+
+	UFUNCTION()
+	void PostMessage(const FString& Message);
+
+private:
+	TWeakObjectPtr<UVeloWebView> Owner;
 };

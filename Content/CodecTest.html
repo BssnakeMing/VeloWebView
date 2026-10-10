@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>VeloWebView H.264/AAC 验收</title>
+  <style>
+    body{margin:24px;background:#14243e;color:#edf3ff;font:16px system-ui,sans-serif}
+    h1{font-size:26px}section{margin:20px 0;padding:18px;background:#203754;border-radius:8px}
+    input,button{font:inherit;padding:9px;margin:4px 4px 8px 0}input{width:min(650px,80%)}
+    video,canvas{width:480px;max-width:100%;background:#070d19}pre{white-space:pre-wrap;overflow-wrap:anywhere}
+    .ok{color:#78e7a5}.fail{color:#ffa5a5}.videos{display:flex;gap:16px;flex-wrap:wrap}
+  </style>
+</head>
+<body>
+  <h1>H.264/AAC：能力与实际播放验收</h1>
+  <p>通过本地 HTTP 打开此页。网页视频测试需要同目录 sample.mp4（H.264 + AAC）；WebRTC 回环仅使用本机画布，无需摄像头或麦克风。</p>
+  <section><h2>1. 当前运行时能力</h2><pre id="capabilities"></pre></section>
+  <section>
+    <h2>2. HTML5 MP4 视频</h2>
+    <input id="url" aria-label="视频 URL" value="sample.mp4"><button id="load">加载并播放</button>
+    <p>先静音自动播放，随后用视频控件解除静音确认 AAC 音频；看到运动画面和时间增长才算播放通过。</p>
+    <video id="fileVideo" controls muted playsinline></video><pre id="fileStatus">尚未加载样本。</pre>
+  </section>
+  <section>
+    <h2>3. 仅使用 H.264 的 WebRTC 本机回环</h2>
+    <button id="start">开始 H.264 回环</button><button id="stop">停止</button>
+    <div class="videos"><div>发送源（画布）<br><canvas id="source" width="640" height="360"></canvas></div>
+    <div>接收的视频<br><video id="remote" autoplay muted playsinline></video></div></div>
+    <pre id="rtcStatus">尚未运行。回环通过仍需另外验证真实 UE Pixel Streaming 服务。</pre>
+    <details><summary>实际 SDP</summary><pre id="sdp"></pre></details>
+  </section>
+  <script>
+    const byId = id => document.getElementById(id);
+    const mimeH264 = 'video/mp4; codecs="avc1.42E01E"';
+    const mimeAac = 'audio/mp4; codecs="mp4a.40.2"';
+    const caps = kind => {
+      try { return window[kind]?.getCapabilities?.('video')?.codecs ?? []; }
+      catch (_) { return []; }
+    };
+    const senderCaps = caps('RTCRtpSender'), receiverCaps = caps('RTCRtpReceiver');
+    const h264 = list => list.filter(c => c.mimeType.toLowerCase() === 'video/h264');
+    const media = byId('fileVideo');
+    byId('capabilities').textContent = JSON.stringify({
+      userAgent:navigator.userAgent,
+      html5H264:media.canPlayType(mimeH264),
+      html5Aac:document.createElement('audio').canPlayType(mimeAac),
+      mediaSourceH264:window.MediaSource?.isTypeSupported(mimeH264) ?? false,
+      webRtcSenderH264:h264(senderCaps), webRtcReceiverH264:h264(receiverCaps)
+    }, null, 2);
+    function fileStatus(extra='') {
+      byId('fileStatus').textContent = JSON.stringify({
+        readyState:media.readyState, paused:media.paused,
+        currentTime:Number(media.currentTime.toFixed(2)), duration:media.duration,
+        width:media.videoWidth,height:media.videoHeight,
+        decodedFrames:media.getVideoPlaybackQuality?.().totalVideoFrames ?? null,
+        error:media.error ? {code:media.error.code,message:media.error.message} : null,
+        note:extra
+      }, null, 2);
+    }
+    ['loadedmetadata','canplay','playing','timeupdate','error','ended'].forEach(name =>
+      media.addEventListener(name, () => fileStatus(name)));
+    byId('load').onclick = async () => {
+      media.src = new URL(byId('url').value,location.href).href;
+      media.load();
+      try { await media.play(); } catch(e) { fileStatus(String(e)); }
+    };
+    let pc1,pc2,stream,paintTimer,statsTimer;
+    function stop() {
+      clearInterval(paintTimer);clearInterval(statsTimer);
+      pc1?.close();pc2?.close();stream?.getTracks().forEach(t=>t.stop());
+      pc1=pc2=stream=null;byId('remote').srcObject=null;
+    }
+    byId('stop').onclick=()=>{stop();byId('rtcStatus').textContent='已停止。'};
+    byId('start').onclick=async()=>{
+      stop();
+      const supported=h264(receiverCaps);
+      if(!supported.length || !h264(senderCaps).length) {
+        byId('rtcStatus').textContent='失败：当前运行时没有报告 sender/receiver H.264 codec，不能做 H.264 回环。';
+        return;
+      }
+      try {
+        const canvas=byId('source'),ctx=canvas.getContext('2d');let frame=0;
+        function paint(){frame++;ctx.fillStyle=`hsl(${frame*3%360} 75% 42%)`;ctx.fillRect(0,0,640,360);
+          ctx.fillStyle='white';ctx.font='40px sans-serif';ctx.fillText('H.264 FRAME '+frame,30,90);
+          ctx.fillRect(30+(frame*8)%550,200,40,60);}
+        paint();paintTimer=setInterval(paint,33);stream=canvas.captureStream(30);
+        pc1=new RTCPeerConnection();pc2=new RTCPeerConnection();
+        const pending1=[],pending2=[];
+        pc1.onicecandidate=e=>{if(e.candidate){if(pc2.remoteDescription)pc2.addIceCandidate(e.candidate).catch(console.error);else pending2.push(e.candidate);}};
+        pc2.onicecandidate=e=>{if(e.candidate){if(pc1.remoteDescription)pc1.addIceCandidate(e.candidate).catch(console.error);else pending1.push(e.candidate);}};
+        pc2.ontrack=e=>{byId('remote').srcObject=e.streams[0];byId('remote').play().catch(console.error);};
+        const transceiver=pc1.addTransceiver(stream.getVideoTracks()[0],{direction:'sendonly',streams:[stream]});
+        // No VP8/VP9/AV1 fallback: success must use an H.264 decoder.
+        transceiver.setCodecPreferences(supported);
+        await pc1.setLocalDescription(await pc1.createOffer());
+        await pc2.setRemoteDescription(pc1.localDescription);
+        for(const c of pending2)await pc2.addIceCandidate(c);
+        await pc2.setLocalDescription(await pc2.createAnswer());
+        await pc1.setRemoteDescription(pc2.localDescription);
+        for(const c of pending1)await pc1.addIceCandidate(c);
+        byId('sdp').textContent='OFFER\n'+pc1.localDescription.sdp+'\nANSWER\n'+pc2.localDescription.sdp;
+        statsTimer=setInterval(async()=>{
+          if(!pc2)return;
+          const stats=await pc2.getStats();let rows=[];
+          stats.forEach(s=>{if(s.type==='inbound-rtp' && s.kind==='video'){
+            const codec=stats.get(s.codecId);
+            rows.push({connection:pc2.connectionState,codec:codec?.mimeType,
+              fmtp:codec?.sdpFmtpLine,framesDecoded:s.framesDecoded,
+              framesReceived:s.framesReceived,bytesReceived:s.bytesReceived,
+              width:s.frameWidth,height:s.frameHeight});
+          }});
+          byId('rtcStatus').textContent=JSON.stringify(rows.length ? rows : {connection:pc2.connectionState,waiting:true},null,2);
+        },500);
+      }catch(e){stop();byId('rtcStatus').textContent='失败：'+String(e);}
+    };
+    window.addEventListener('pagehide',stop);
+  </script>
+</body>
+</html>
