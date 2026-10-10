@@ -27,6 +27,13 @@ pinned standard CEF package directly. The custom codec-enabled build is
 documented in [`CEF_VERSION.md`](CEF_VERSION.md) and may require separate
 patent and third-party license review before redistribution.
 
-The GitHub Release asset `VeloWebView-1.0.0-UE5.4.zip` is the complete packaged
-plugin from the tested checkout. It keeps the Unreal `Intermediate` files that
-contain `.precompiled` metadata required by the packaged UE 5.4 modules.
+The [GitHub Release asset `VeloWebView-1.0.0-UE5.4.zip`](https://github.com/BssnakeMing/VeloWebView/releases/download/v1.0.0/VeloWebView-1.0.0-UE5.4.zip)
+is the complete packaged plugin from the tested checkout. It keeps the Unreal
+`Intermediate` files that contain `.precompiled` metadata required by the
+packaged UE 5.4 modules.
+
+Release asset SHA-256:
+
+```text
+13a3c11482147f5d5e8961909f401e6bd696c66d1aea108f42adedbbbe53db86
+```

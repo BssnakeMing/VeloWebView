@@ -48,10 +48,10 @@ the archive's included layout):
 - [CEF_154.0.32_g682c378_chromium-154.0.8037.58_windows64_UE_WebBrowser.zip](https://1823780428.share.123pan.cn/123pan/MRgYjv-vIFOH?pwd=9lfo)
 - 123 云盘提取码：`9lfo`
 
-The compiled `VeloWebView-1.0.0-UE5.4.zip` package is published on the
-GitHub Releases page. It contains the packaged plugin, Win64 runtime and the
-precompiled metadata required by Unreal 5.4; the external CEF archive is also
-provided for source builds and repackaging.
+The compiled [`VeloWebView-1.0.0-UE5.4.zip`](https://github.com/BssnakeMing/VeloWebView/releases/tag/v1.0.0)
+package is published on the GitHub Releases page. It contains the packaged
+plugin, Win64 runtime and the precompiled metadata required by Unreal 5.4; the
+external CEF archive is also provided for source builds and repackaging.
 See [`Docs/CEF_DOWNLOAD.md`](Docs/CEF_DOWNLOAD.md) for the expected layout and
 license notes.
 
