@@ -9,6 +9,9 @@
 	<androidManifestUpdates>
 		<addPermission android:name="android.permission.INTERNET" />
 		<addPermission android:name="android.permission.ACCESS_NETWORK_STATE" />
+		<!-- Native WebView supports trusted HTTP/LAN pages such as an on-device
+		     development server. Android 9+ blocks cleartext traffic by default. -->
+		<addAttribute tag="application" name="android:usesCleartextTraffic" value="true" />
 		<!-- These permissions are only granted after an explicit WebView/UE
 		     permission decision and Android runtime permission grant. -->
 		<addPermission android:name="android.permission.CAMERA" />

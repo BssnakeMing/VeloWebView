@@ -83,15 +83,20 @@ public class VeloWebView : ModuleRules
 			if (!string.IsNullOrEmpty(HostPath))
 			{
 				const string HostFileName = "VeloWebViewBrowserHost.exe";
-				string HostTarget = "$(BinaryOutputDir)/" + HostFileName;
+				// Editor modules are DLLs emitted into the plugin's Binaries folder,
+				// while a game/shipping target emits its executable dependencies into
+				// the project's Binaries folder. Keep the host beside the executable
+				// for game targets so CEF can be loaded from the same directory.
+				string HostTarget = Target.Type == TargetType.Editor
+					? "$(PluginDir)/Binaries/Win64/" + HostFileName
+					: "$(BinaryOutputDir)/" + HostFileName;
 				string PackagedHostPath = Path.Combine(PluginDirectory, "Binaries", "Win64", HostFileName);
 
-				// A packaged plugin already contains the host in its output directory.
-				// Registering that file as a source/target copy makes UBT map the same
-				// path to itself and fail with "listed as a source and target file".
-				// Keep it as a source-less dependency in that case; a fresh plugin
-				// package still gets the file through FilterPlugin.ini below.
-				if (string.Equals(
+				// A packaged plugin already contains the host in the editor module's
+				// output directory. Registering that file as a source/target copy makes
+				// UBT map the same path to itself and fail. Game targets intentionally
+				// copy it from the plugin into the project's Binaries folder.
+				if (Target.Type == TargetType.Editor && string.Equals(
 					Path.GetFullPath(HostPath),
 					Path.GetFullPath(PackagedHostPath),
 					StringComparison.OrdinalIgnoreCase))
@@ -105,6 +110,13 @@ public class VeloWebView : ModuleRules
 			}
 			string CefRoot = Path.Combine(PluginDirectory, "ThirdParty", "CEF");
 			string CefRelease = Path.Combine(CefRoot, "Release");
+			// Keep the executable and every CEF runtime file in one directory. In
+			// the editor this is the plugin's staged bundle; game targets place the
+			// bundle beside the packaged executable. Splitting chrome_elf.dll from
+			// libcef.dll lets an older Unreal WebBrowser DLL be picked up at runtime.
+			string CefTargetDirectory = Target.Type == TargetType.Editor
+				? "$(PluginDir)/Binaries/Win64"
+				: "$(BinaryOutputDir)";
 			if (Directory.Exists(CefRelease))
 			{
 				foreach (string RuntimeFile in Directory.GetFiles(CefRelease, "*", SearchOption.TopDirectoryOnly))
@@ -114,7 +126,7 @@ public class VeloWebView : ModuleRules
 						Extension == ".pak" || Extension == ".json")
 					{
 						RuntimeDependencies.Add(
-							"$(BinaryOutputDir)/" + Path.GetFileName(RuntimeFile),
+							CefTargetDirectory + "/" + Path.GetFileName(RuntimeFile),
 							RuntimeFile);
 					}
 				}
@@ -127,7 +139,7 @@ public class VeloWebView : ModuleRules
 				{
 					string Relative = ResourceFile.Substring(CefResources.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
 					RuntimeDependencies.Add(
-						"$(BinaryOutputDir)/" + Relative.Replace('\\', '/'),
+						CefTargetDirectory + "/" + Relative.Replace('\\', '/'),
 						ResourceFile);
 				}
 			}

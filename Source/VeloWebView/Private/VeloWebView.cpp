@@ -428,9 +428,19 @@ bool UVeloWebView::LoadHostHTML(const FString& InitialIframeURL)
 		*VeloWebViewPrivate::EscapeJavaScriptString(IframeURL),
 		ESearchCase::CaseSensitive);
 
-	// A synthetic HTTPS base URL gives CEF LoadString a stable document origin
-	// while still allowing the iframe to navigate to the requested web page.
-	LoadHTML(HostHTML, TEXT("https://velowebview.local/"));
+	// Keep the synthetic host document on the same scheme as an HTTP iframe on
+	// Android.  Otherwise the iframe becomes mixed content under the default
+	// WebView policy and is silently blocked before it can reach a LAN server.
+	// CEF/Windows keeps the HTTPS synthetic origin used by the existing host
+	// page contract.
+	FString HostBaseURL = TEXT("https://velowebview.local/");
+#if PLATFORM_ANDROID
+	if (IframeURL.StartsWith(TEXT("http://"), ESearchCase::IgnoreCase))
+	{
+		HostBaseURL = TEXT("http://velowebview.local/");
+	}
+#endif
+	LoadHTML(HostHTML, HostBaseURL);
 	return true;
 }
 

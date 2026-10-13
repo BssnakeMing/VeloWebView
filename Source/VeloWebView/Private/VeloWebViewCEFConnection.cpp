@@ -11,6 +11,7 @@
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
 #include <windows.h>
+#include <winver.h>
 #include "Windows/HideWindowsPlatformTypes.h"
 #endif
 
@@ -18,14 +19,91 @@ namespace VeloCEFPrivate
 {
 	using namespace VeloWebView::Protocol;
 
+	#if PLATFORM_WINDOWS
+	static bool ReadFileVersionMajor(const FString& FilePath, uint32& OutMajor)
+	{
+		// Resolve the version API dynamically so the plugin does not add a hard
+		// link on Version.lib to every Unreal target.  This is only a lightweight
+		// compatibility check; CEF's libcef and chrome_elf must come from the
+		// same Chromium build or the host can fail before creating its pipe.
+		HMODULE VersionModule = ::LoadLibraryW(L"version.dll");
+		if (!VersionModule) return false;
+
+		using FGetFileVersionInfoSizeW = DWORD (WINAPI*)(LPCWSTR, LPDWORD);
+		using FGetFileVersionInfoW = BOOL (WINAPI*)(LPCWSTR, DWORD, DWORD, LPVOID);
+		using FVerQueryValueW = BOOL (WINAPI*)(LPCVOID, LPCWSTR, LPVOID*, PUINT);
+		const auto GetSize = reinterpret_cast<FGetFileVersionInfoSizeW>(
+			::GetProcAddress(VersionModule, "GetFileVersionInfoSizeW"));
+		const auto GetInfo = reinterpret_cast<FGetFileVersionInfoW>(
+			::GetProcAddress(VersionModule, "GetFileVersionInfoW"));
+		const auto QueryValue = reinterpret_cast<FVerQueryValueW>(
+			::GetProcAddress(VersionModule, "VerQueryValueW"));
+		if (!GetSize || !GetInfo || !QueryValue)
+		{
+			::FreeLibrary(VersionModule);
+			return false;
+		}
+
+		const FString FullPath = FPaths::ConvertRelativePathToFull(FilePath);
+		DWORD Handle = 0;
+		const DWORD Size = GetSize(*FullPath, &Handle);
+		if (Size == 0 || Size > static_cast<DWORD>(MAX_int32))
+		{
+			::FreeLibrary(VersionModule);
+			return false;
+		}
+
+		TArray<uint8> VersionData;
+		VersionData.SetNumUninitialized(static_cast<int32>(Size));
+		if (!GetInfo(*FullPath, Handle, Size, VersionData.GetData()))
+		{
+			::FreeLibrary(VersionModule);
+			return false;
+		}
+
+		VS_FIXEDFILEINFO* FixedInfo = nullptr;
+		UINT FixedInfoSize = 0;
+		const bool bHasFixedInfo = QueryValue(
+			VersionData.GetData(), TEXT("\\"), reinterpret_cast<LPVOID*>(&FixedInfo), &FixedInfoSize) &&
+			FixedInfo && FixedInfoSize >= sizeof(VS_FIXEDFILEINFO) &&
+			FixedInfo->dwSignature == VS_FFI_SIGNATURE;
+		if (bHasFixedInfo)
+		{
+			OutMajor = HIWORD(FixedInfo->dwFileVersionMS);
+		}
+		::FreeLibrary(VersionModule);
+		return bHasFixedInfo;
+	}
+	#endif
+
 	static bool HasHostRuntime(const FString& HostPath)
 	{
 		const FString Directory = FPaths::GetPath(HostPath);
-		return FPaths::FileExists(HostPath) &&
-			FPaths::FileExists(FPaths::Combine(Directory, TEXT("libcef.dll"))) &&
-			FPaths::FileExists(FPaths::Combine(Directory, TEXT("chrome_elf.dll"))) &&
-			FPaths::FileExists(FPaths::Combine(Directory, TEXT("icudtl.dat"))) &&
-			FPaths::FileExists(FPaths::Combine(Directory, TEXT("resources.pak")));
+		const FString LibCefPath = FPaths::Combine(Directory, TEXT("libcef.dll"));
+		const FString ChromeElfPath = FPaths::Combine(Directory, TEXT("chrome_elf.dll"));
+		if (!FPaths::FileExists(HostPath) ||
+			!FPaths::FileExists(LibCefPath) ||
+			!FPaths::FileExists(ChromeElfPath) ||
+			!FPaths::FileExists(FPaths::Combine(Directory, TEXT("icudtl.dat"))) ||
+			!FPaths::FileExists(FPaths::Combine(Directory, TEXT("resources.pak"))))
+		{
+			return false;
+		}
+
+		#if PLATFORM_WINDOWS
+		uint32 LibCefMajor = 0;
+		uint32 ChromeElfMajor = 0;
+		if (ReadFileVersionMajor(LibCefPath, LibCefMajor) &&
+			ReadFileVersionMajor(ChromeElfPath, ChromeElfMajor) &&
+			LibCefMajor != ChromeElfMajor)
+		{
+			// Unreal's WebBrowser module can leave an older chrome_elf.dll in the
+			// project's Binaries/Win64 directory.  Loading it beside a newer
+			// libcef.dll produces STATUS_ENTRYPOINT_NOT_FOUND before CEF starts.
+			return false;
+		}
+		#endif
+		return true;
 	}
 
 	static FString MakeDefaultHostPath()
@@ -35,6 +113,10 @@ namespace VeloCEFPrivate
 		const FString Base = Plugin->GetBaseDir();
 		const TArray<FString> Candidates =
 		{
+			// Prefer the plugin's staged bundle.  The project binary directory may
+			// also contain Unreal's WebBrowser/Chromium runtime, which is unrelated
+			// to this CEF build and must not be mixed with libcef.dll.
+			FPaths::Combine(Base, TEXT("Binaries/Win64/VeloWebViewBrowserHost.exe")),
 			// Packaged builds stage RuntimeDependencies in the game's binary
 			// directory rather than beside the plugin source.
 			FPaths::Combine(FPlatformProcess::BaseDir(), TEXT("VeloWebViewBrowserHost.exe")),
@@ -44,7 +126,6 @@ namespace VeloCEFPrivate
 			FPaths::Combine(Base, TEXT("BrowserHost/build/Release/VeloWebViewBrowserHost.exe")),
 			FPaths::Combine(Base, TEXT("BrowserHost/VeloWebViewBrowserHost.exe")),
 			FPaths::Combine(Base, TEXT("BrowserHost/BrowserHost.exe")),
-			FPaths::Combine(Base, TEXT("Binaries/Win64/VeloWebViewBrowserHost.exe")),
 			FPaths::Combine(Base, TEXT("Binaries/Win64/BrowserHost.exe"))
 		};
 		for (const FString& Candidate : Candidates)
@@ -245,7 +326,7 @@ bool FVeloCEFConnection::Start(const FVeloCEFConnectionConfig& Config)
 	}
 	if (!VeloCEFPrivate::HasHostRuntime(HostPath))
 	{
-		Impl->SetError(FString::Printf(TEXT("CEF BrowserHost runtime is incomplete beside %s. Stage libcef.dll, chrome_elf.dll, icudtl.dat and resources.pak with the host."), *HostPath));
+		Impl->SetError(FString::Printf(TEXT("CEF BrowserHost runtime is missing or incompatible beside %s. Keep libcef.dll, chrome_elf.dll, icudtl.dat and resources.pak from the same CEF bundle."), *HostPath));
 		return false;
 	}
 
