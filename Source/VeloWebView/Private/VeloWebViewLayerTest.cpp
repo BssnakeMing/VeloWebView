@@ -57,8 +57,8 @@ namespace
 		UE_LOG(LogVeloWebView, Display, TEXT("Layer test UMG overlay attached"));
 		// Keep the page self-contained so this command tests the complete
 		// Slate -> CEF -> DOM input path without depending on a project widget.
-		// The DOM itself reports clicks, editing, wheel and drag events. This
-		// remains useful even while the external host's JS bridge is incomplete.
+		// The DOM reports clicks, editing, wheel and drag events. The delayed
+		// request also verifies a complete page -> UE -> Promise -> UE round trip.
 		WebView->LoadHTML(TEXT(R"VELOHTML(
 <html><head><meta charset="utf-8"><style>
 html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#193eaa;color:white;font:28px sans-serif}
@@ -72,7 +72,7 @@ document.getElementById('text').addEventListener('input',function(e){document.ge
 document.getElementById('drag').addEventListener('input',function(e){document.getElementById('dragstatus').textContent='drag: '+e.target.value});
 function scrollStatus(){document.getElementById('scrollstatus').textContent='scroll: '+Math.round(sc.scrollTop)+' wheel: '+w}
 sc.addEventListener('wheel',function(){w++;scrollStatus()});sc.addEventListener('scroll',scrollStatus);
-setTimeout(function(){if(window.VeloWebView)window.VeloWebView.postMessage('VeloLayerTest');},1500);
+setTimeout(function(){if(window.VeloWebView&&window.VeloWebView.request){window.VeloWebView.request('VeloLayerTest',null,4000).then(function(){console.error('Layer test unexpectedly resolved an unhandled method')}).catch(function(e){if(e.message==='No native JavaScript request handler is bound.')window.VeloWebView.postMessage('VeloLayerTest');else console.error(e.message)})}},1500);
 })();</script></body></html>
 )VELOHTML"), TEXT("http://velowebview.local/"));
 

@@ -71,6 +71,7 @@ public class VeloWebViewWindows : ModuleRules
 		{
 			PublicSystemIncludePaths.Add(IncludePath);
 		}
+		PrivateIncludePaths.Add(Path.GetFullPath(Path.Combine(ModuleDirectory, "../../Shared")));
 
 		// WebView2Loader is loaded with LoadLibrary/GetProcAddress.  An import
 		// library is optional and is deliberately not required for compilation.

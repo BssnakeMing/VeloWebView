@@ -1,4 +1,5 @@
 #include "VeloWebViewWindows.h"
+#include "JavaScriptBridge/BridgeScript.h"
 
 #include "Async/Async.h"
 #include "HAL/FileManager.h"
@@ -139,6 +140,7 @@ public:
 
 		Callbacks = InCallbacks;
 		HostWindow = InHostWindow;
+		bBridgeInstalled = false;
 		State = EVeloWebViewWindowsState::Initializing;
 
 #if PLATFORM_WINDOWS && VELO_WEBVIEW_HAS_WEBVIEW2
@@ -179,6 +181,7 @@ public:
 
 	void Shutdown()
 	{
+		bBridgeInstalled = false;
 		if (State == EVeloWebViewWindowsState::Destroyed)
 		{
 			return;
@@ -207,7 +210,7 @@ public:
 	}
 
 	EVeloWebViewWindowsState GetState() const { return State; }
-	bool IsReady() const { return State == EVeloWebViewWindowsState::Ready || State == EVeloWebViewWindowsState::Loading; }
+	bool IsReady() const { return bBridgeInstalled && (State == EVeloWebViewWindowsState::Ready || State == EVeloWebViewWindowsState::Loading); }
 
 	void SetHostWindow(void* InHostWindow)
 	{
@@ -750,17 +753,6 @@ private:
 					Self->ConfigureSettings();
 					Self->RegisterEvents();
 					Self->InstallBridge();
-					Self->State = EVeloWebViewWindowsState::Ready;
-					if (!Self->PendingHTML.IsEmpty())
-					{
-						const FString HTML = MoveTemp(Self->PendingHTML);
-						Self->LoadHTML(HTML);
-					}
-					else if (!Self->PendingURL.IsEmpty())
-					{
-						const FString URL = MoveTemp(Self->PendingURL);
-						Self->LoadURL(URL);
-					}
 					return S_OK;
 				}).Get());
 
@@ -781,20 +773,45 @@ private:
 		SetBackgroundTransparent(bTransparent);
 	}
 
-		void InstallBridge()
-		{
-			static const TCHAR* BridgeScript =
-				TEXT("(function(){window.VeloWebView=window.VeloWebView||{};"
-				"window.VeloWebView.postMessage=function(m){"
-				"try{window.chrome.webview.postMessage(String(m));}catch(e){}};"
-				"if(!window.__VeloConsoleInstalled){window.__VeloConsoleInstalled=true;"
+	void InstallBridge()
+	{
+		const FString Script = FString(UTF8_TO_TCHAR(VeloWebView::JavaScriptBridgeSource)) +
+				TEXT("(function(){if(window.__VeloConsoleInstalled)return;window.__VeloConsoleInstalled=true;"
 				"['log','warn','error','info','debug'].forEach(function(k){var o=console[k];"
 				"console[k]=function(){try{var a=Array.prototype.slice.call(arguments).map(function(v){"
 				"try{return typeof v==='string'?v:JSON.stringify(v);}catch(e){return String(v);}});"
 				"window.chrome.webview.postMessage('__VELO_CONSOLE__'+JSON.stringify({message:a.join(' '),source:String(location.href),line:0}));"
-				"}catch(e){}if(o){try{o.apply(console,arguments);}catch(e){}}};});}})();");
-			WebView->AddScriptToExecuteOnDocumentCreated(BridgeScript, nullptr);
-		}
+				"}catch(e){}if(o){try{o.apply(console,arguments);}catch(e){}}};});})();");
+		// Registration is asynchronous. Navigating before this completion can
+		// leave the first document without a bridge even though later reloads work.
+		const HRESULT Result = WebView->AddScriptToExecuteOnDocumentCreated(*Script,
+			Microsoft::WRL::Callback<ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>(
+				[WeakImpl = TWeakPtr<FImpl>(AsShared())](HRESULT ErrorCode, LPCWSTR) -> HRESULT
+				{
+					const TSharedPtr<FImpl> Self = WeakImpl.Pin();
+					if (!Self || !Self->WebView || Self->State == EVeloWebViewWindowsState::Destroyed ||
+						Self->State == EVeloWebViewWindowsState::Failed) return S_OK;
+					if (FAILED(ErrorCode))
+					{
+						Self->Fail(static_cast<int32>(ErrorCode), TEXT("WebView2 JavaScript bridge registration failed"));
+						return S_OK;
+					}
+					Self->bBridgeInstalled = true;
+					Self->State = EVeloWebViewWindowsState::Ready;
+					if (!Self->PendingHTML.IsEmpty())
+					{
+						const FString HTML = MoveTemp(Self->PendingHTML);
+						Self->LoadHTML(HTML);
+					}
+					else
+					{
+						const FString URL = Self->PendingURL.IsEmpty() ? TEXT("about:blank") : MoveTemp(Self->PendingURL);
+						Self->LoadURL(URL);
+					}
+					return S_OK;
+				}).Get());
+		if (FAILED(Result)) Fail(static_cast<int32>(Result), TEXT("WebView2 JavaScript bridge registration failed"));
+	}
 
 	void RegisterEvents()
 	{
@@ -953,42 +970,38 @@ private:
 				{
 					const TSharedPtr<FImpl> Self = WeakImpl.Pin();
 					if (!Self) return S_OK;
-					LPWSTR RawMessage = nullptr;
-					if (Args && SUCCEEDED(Args->TryGetWebMessageAsString(&RawMessage)))
-						{
-							const FString Message = VeloWebViewWindowsPrivate::TakeOwnedString(RawMessage);
-							static const FString ConsolePrefix = TEXT("__VELO_CONSOLE__");
-							if (Message.StartsWith(ConsolePrefix) && Callbacks.OnConsoleMessage)
-							{
-								FString ConsoleMessage;
-								FString ConsoleSource = LastURL;
-								int32 ConsoleLine = 0;
-								const FString Payload = Message.Mid(ConsolePrefix.Len());
-								TSharedPtr<FJsonObject> JsonObject;
-								const TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Payload);
-								if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
-								{
-									JsonObject->TryGetStringField(TEXT("message"), ConsoleMessage);
-									JsonObject->TryGetStringField(TEXT("source"), ConsoleSource);
-									double LineValue = 0.0;
-									if (JsonObject->TryGetNumberField(TEXT("line"), LineValue)) ConsoleLine = FMath::RoundToInt(LineValue);
-								}
-								else
-								{
-									ConsoleMessage = Payload;
-								}
-								FVeloWebViewWindowsCallbacks Local = Callbacks;
-								VeloWebViewWindowsPrivate::DispatchToGameThread([Local, ConsoleMessage, ConsoleSource, ConsoleLine]() mutable
-								{
-									if (Local.OnConsoleMessage) Local.OnConsoleMessage(ConsoleMessage, ConsoleSource, ConsoleLine);
-								});
-							}
-							else if (Callbacks.OnJavaScriptMessage)
-							{
-								FVeloWebViewWindowsCallbacks Local = Callbacks;
-								VeloWebViewWindowsPrivate::DispatchToGameThread([Local, Message]() mutable { if (Local.OnJavaScriptMessage) Local.OnJavaScriptMessage(Message); });
-						}
+			LPWSTR RawMessage = nullptr;
+			if (Args && SUCCEEDED(Args->TryGetWebMessageAsString(&RawMessage)))
+			{
+				const FString Message = VeloWebViewWindowsPrivate::TakeOwnedString(RawMessage);
+				static const FString ConsolePrefix = TEXT("__VELO_CONSOLE__");
+				FVeloWebViewWindowsCallbacks Local = Callbacks;
+				if (Message.StartsWith(ConsolePrefix) && Local.OnConsoleMessage)
+				{
+					FString ConsoleMessage;
+					FString ConsoleSource = Self->LastURL;
+					int32 ConsoleLine = 0;
+					TSharedPtr<FJsonObject> Console;
+					if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Message.Mid(ConsolePrefix.Len())), Console) && Console.IsValid())
+					{
+						Console->TryGetStringField(TEXT("message"), ConsoleMessage);
+						Console->TryGetStringField(TEXT("source"), ConsoleSource);
+						double Line = 0;
+						if (Console->TryGetNumberField(TEXT("line"), Line)) ConsoleLine = FMath::RoundToInt(Line);
 					}
+					VeloWebViewWindowsPrivate::DispatchToGameThread([Local, ConsoleMessage, ConsoleSource, ConsoleLine]() mutable
+					{
+						if (Local.OnConsoleMessage) Local.OnConsoleMessage(ConsoleMessage, ConsoleSource, ConsoleLine);
+					});
+				}
+				else if (Local.OnJavaScriptMessage)
+				{
+					VeloWebViewWindowsPrivate::DispatchToGameThread([Local, Message]() mutable
+					{
+						if (Local.OnJavaScriptMessage) Local.OnJavaScriptMessage(Message);
+					});
+				}
+			}
 					return S_OK;
 				}).Get(), &WebMessageReceivedToken);
 
@@ -1122,6 +1135,7 @@ private:
 	FIntRect Bounds;
 	bool bVisible;
 	bool bJavaScriptEnabled;
+	bool bBridgeInstalled = false;
 	bool bMediaAutoplay;
 	bool bMuted;
 	bool bTransparent;

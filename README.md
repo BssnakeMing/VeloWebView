@@ -92,7 +92,8 @@ area every Slate tick.
 
 `VeloWebViewManager` owns a map of instance IDs, creates views on the Android UI
 thread, and places them in a transparent overlay above the UE content view.
-JavaScript interface exposure is limited to `window.VeloWebView.postMessage`.
+The Java interface only transports message strings. The shared page bridge
+adds named Promise requests and native message listeners on top of it.
 HTML video, audio, autoplay policy, HLS/DASH/WebRTC JavaScript players and
 `WebChromeClient` fullscreen are delegated to the system WebView/media stack.
 
@@ -194,18 +195,57 @@ delegates are broadcast.
 
 ## JavaScript bridge
 
-The page-facing API in Native Overlay mode is identical on Windows and Android.
-Composited mode installs the same `postMessage` shim after document loading:
+The same main-document API is installed in Windows CEF/WebView2 and Android WebView:
 
 ```javascript
-window.VeloWebView.postMessage("hello");
-window.VeloWebView.postMessage(JSON.stringify({event:"VideoStarted", id:"10086"}));
+function connectToUnreal() {
+  VeloWebView.postMessage("hello");
+  VeloWebView.postMessage({event:"VideoStarted", id:"10086"});
+  VeloWebView.onmessage = event => console.log("From UE:", event.data);
+  VeloWebView.request("getPlayerState", {playerId:"10086"})
+    .then(state => console.log(state))
+    .catch(error => console.error(error.message));
+}
+if (window.VeloWebView && VeloWebView.isReady) connectToUnreal();
+else window.addEventListener("velowebviewready", connectToUnreal, {once:true});
 ```
 
-Use `OnJavaScriptMessage` in Blueprint/C++ to receive the string. UE-to-page
-calls use `ExecuteJavaScript`, for example
-`window.player && window.player.play();`. The bridge does not expose arbitrary
-UObjects or native function invocation.
+`OnJavaScriptMessage` receives posted strings; non-string values are sent as
+JSON text. Bind `OnJavaScriptRequest` for named asynchronous page requests. Its
+parameters are the request ID, method name and JSON parameters. Call
+`RespondToJavaScript(RequestId, ResultJSON)` or
+`RejectJavaScriptRequest(RequestId, Error)` to settle the page's Promise. The
+page rejects requests when UE does not bind a handler or when the request times
+out.
+
+Use `PostMessageToJavaScript` to dispatch a string as `event.data`, or
+`PostJSONToJavaScript` to dispatch a JSON value. JavaScript can receive either
+with `window.VeloWebView.onmessage` or
+`window.VeloWebView.addEventListener("message", handler)`. Bind
+`OnJavaScriptBridgeReady` before sending. `ExecuteJavaScriptWithResult` reports
+the JSON value or JavaScript error through its callback and awaits returned
+Promises. These APIs return without sending when the page bridge is not ready.
+
+Request/result values support JSON objects, arrays and scalar roots, including
+`null`. Quote a string result as JSON, for example `"playing"`. Each direction
+allows 128 pending requests, defaults to 30 seconds, and caps the configurable
+timeout at 300 seconds. JavaScript's third `request` argument is milliseconds;
+`ExecuteJavaScriptWithResult` uses seconds. Navigation, unload and widget release
+clear pending callbacks; document session IDs prevent delayed messages from
+being delivered to a replacement page. Payloads are limited to 1 MiB minus the
+24-byte transport header. `__VELO_RPC__` is reserved for bridge packets.
+
+CEF/WebView2 install before the page's own scripts. Android's engine browser and
+native fallback install during loading or on completion, so pages should use
+the readiness check/event above. Requests and native-to-page messages target the
+main document. Cross-origin iframe integrations must use their host page's
+explicit `window.postMessage` relay. CEF's JavaScript content setting applies
+to subsequent navigation; the UE bridge rejects new calls immediately when
+`SetJavaScriptEnabled(false)` is used.
+
+The request API only exposes named operations that the application explicitly
+handles; validate the method and parameters before performing privileged game
+actions.
 
 ## Host page and iframe
 

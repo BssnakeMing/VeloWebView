@@ -59,6 +59,12 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 @SuppressWarnings("deprecation")
 public final class VeloWebViewManager {
+    private static volatile String javaScriptBridgeSource = "";
+
+    /** Supplied by JNI from the shared bridge header before creating a view. */
+    public static void setJavaScriptBridgeSource(String source) {
+        javaScriptBridgeSource = source == null ? "" : source;
+    }
     private static final String TAG = "VeloWebView";
     private static final Object LOCK = new Object();
     private static final AtomicInteger NEXT_ID = new AtomicInteger(1);
@@ -692,7 +698,16 @@ public final class VeloWebViewManager {
             webView.setX(x * density);
             webView.setY(y * density);
         }
-        void setJavaScriptEnabled(boolean enabled) { webView.getSettings().setJavaScriptEnabled(enabled); }
+        void setJavaScriptEnabled(boolean enabled) {
+            webView.getSettings().setJavaScriptEnabled(enabled);
+            if (enabled) injectJavaScriptBridge();
+        }
+        void injectJavaScriptBridge() {
+            if (!webView.getSettings().getJavaScriptEnabled() || javaScriptBridgeSource.isEmpty()) return;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                webView.evaluateJavascript(javaScriptBridgeSource, null);
+            }
+        }
         void setMediaAutoplay(boolean enabled) { mediaAutoplay = enabled; webView.getSettings().setMediaPlaybackRequiresUserGesture(!enabled); }
         void setMuted(boolean value) { muted = value; injectMutedState(); }
         void setUserAgent(String value) { webView.getSettings().setUserAgentString(value == null ? WebSettings.getDefaultUserAgent(host) : value); }
@@ -837,6 +852,7 @@ public final class VeloWebViewManager {
             notifyPageStarted(owner.id, url); notifyUrlChanged(owner.id, url);
         }
         @Override public void onPageFinished(WebView view, String url) {
+            owner.injectJavaScriptBridge();
             owner.injectMutedState(); notifyPageLoaded(owner.id, url); notifyUrlChanged(owner.id, url);
         }
         @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {

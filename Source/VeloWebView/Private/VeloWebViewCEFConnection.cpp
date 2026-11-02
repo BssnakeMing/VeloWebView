@@ -165,6 +165,7 @@ public:
 	FString LastError;
 	FString LastURL;
 	FString LastTitle;
+	FVeloCEFConnection::FOnBrowserMessage OnBrowserMessage;
 	FString PipeName;
 	FString InstanceId;
 	uint32 NumericInstanceId = 0;
@@ -177,6 +178,7 @@ public:
 	HANDLE FrameMapping = nullptr;
 	uint8* FrameView = nullptr;
 	uint64 LastFrameSequence = 0;
+	TArray<uint8> IncomingBytes;
 #endif
 
 	void SetError(const FString& Error)
@@ -237,6 +239,54 @@ public:
 			return false;
 		}
 		return true;
+	}
+
+	void PumpMessages()
+	{
+		if (Pipe == INVALID_HANDLE_VALUE) return;
+		DWORD Available = 0;
+		if (!::PeekNamedPipe(Pipe, nullptr, 0, nullptr, &Available, nullptr))
+		{
+			SetError(TEXT("CEF BrowserHost IPC connection was closed."));
+			::CloseHandle(Pipe);
+			Pipe = INVALID_HANDLE_VALUE;
+			return;
+		}
+		if (Available > 0)
+		{
+			TArray<uint8> Chunk;
+			Chunk.SetNumUninitialized(static_cast<int32>(FMath::Min<DWORD>(Available, 256 * 1024)));
+			DWORD Read = 0;
+			if (!::ReadFile(Pipe, Chunk.GetData(), static_cast<DWORD>(Chunk.Num()), &Read, nullptr))
+			{
+				SetError(TEXT("CEF BrowserHost IPC read failed."));
+				return;
+			}
+			Chunk.SetNum(static_cast<int32>(Read), false);
+			IncomingBytes.Append(Chunk);
+		}
+		while (IncomingBytes.Num() >= static_cast<int32>(sizeof(VeloWebView::Protocol::FMessageHeader)))
+		{
+			VeloWebView::Protocol::FMessageHeader Header;
+			FMemory::Memcpy(&Header, IncomingBytes.GetData(), sizeof(Header));
+			if (!VeloWebView::Protocol::IsValid(Header, Header.Size) || Header.InstanceId != NumericInstanceId)
+			{
+				SetError(TEXT("CEF BrowserHost sent an invalid IPC event."));
+				IncomingBytes.Reset();
+				return;
+			}
+			if (IncomingBytes.Num() < static_cast<int32>(Header.Size)) return;
+			const uint8* Payload = IncomingBytes.GetData() + sizeof(Header);
+			const int32 PayloadLength = static_cast<int32>(Header.Size - sizeof(Header));
+			const FUTF8ToTCHAR Converted(reinterpret_cast<const ANSICHAR*>(Payload), PayloadLength);
+			const FString Text(Converted.Length(), Converted.Get());
+			IncomingBytes.RemoveAt(0, Header.Size, false);
+			if (Header.Type == static_cast<uint16>(VeloWebView::Protocol::EMessageType::UrlChanged)) LastURL = Text;
+			if (Header.Type == static_cast<uint16>(VeloWebView::Protocol::EMessageType::TitleChanged)) LastTitle = Text;
+			if (Header.Type != static_cast<uint16>(VeloWebView::Protocol::EMessageType::HelloReply) && OnBrowserMessage)
+				OnBrowserMessage(Header.Type, Text);
+			if (State != EVeloCEFConnectionState::Connected) return;
+		}
 	}
 
 	void CloseFrameMapping()
@@ -349,11 +399,11 @@ bool FVeloCEFConnection::Start(const FVeloCEFConnectionConfig& Config)
 		Impl->SetError(FString::Printf(TEXT("Unable to create CEF BrowserHost data directory: %s"), *CachePath));
 		return false;
 	}
-	const FString Args = FString::Printf(TEXT("--pipe=%s --instance-id=%s --cache-path=%s --width=%d --height=%d --fps=%d%s%s%s%s"),
+	const FString Args = FString::Printf(TEXT("--pipe=%s --instance-id=%s --cache-path=%s --width=%d --height=%d --fps=%d --javascript-enabled=%d%s%s%s%s"),
 		*VeloCEFPrivate::EscapeArgument(Impl->PipeName),
 		*FString::Printf(TEXT("%u"), Impl->NumericInstanceId),
 		*VeloCEFPrivate::EscapeArgument(CachePath),
-		Config.InitialSize.X, Config.InitialSize.Y, Config.FrameRate,
+		Config.InitialSize.X, Config.InitialSize.Y, Config.FrameRate, Config.bEnableJavaScript ? 1 : 0,
 		Config.InitialURL.IsEmpty() ? TEXT("") : *FString::Printf(TEXT(" --url=%s"), *VeloCEFPrivate::EscapeArgument(Config.InitialURL)),
 		Config.bDisableGPU ? TEXT(" --disable-gpu") : TEXT(""),
 		Config.bAllowMediaCapture ? TEXT(" --allow-media-capture") : TEXT(""),
@@ -392,6 +442,7 @@ void FVeloCEFConnection::Tick(float DeltaSeconds)
 		FPlatformProcess::CloseProc(Impl->Process);
 		Impl->Process.Reset();
 	}
+	if (Impl->State == EVeloCEFConnectionState::Connected) Impl->PumpMessages();
 #endif
 }
 
@@ -401,7 +452,6 @@ void FVeloCEFConnection::Stop()
 	if (Impl->Pipe != INVALID_HANDLE_VALUE)
 	{
 		Impl->Send(VeloWebView::Protocol::EMessageType::Shutdown);
-		::FlushFileBuffers(Impl->Pipe);
 		::CloseHandle(Impl->Pipe);
 		Impl->Pipe = INVALID_HANDLE_VALUE;
 	}
@@ -414,6 +464,9 @@ void FVeloCEFConnection::Stop()
 	}
 #endif
 	Impl->State = EVeloCEFConnectionState::Disconnected;
+#if PLATFORM_WINDOWS
+	Impl->IncomingBytes.Reset();
+#endif
 }
 
 EVeloCEFConnectionState FVeloCEFConnection::GetState() const { return Impl->State; }
@@ -441,6 +494,7 @@ void FVeloCEFConnection::MarkCpuFrameConsumed(uint64 Sequence)
 FString FVeloCEFConnection::GetLastError() const { return Impl->LastError; }
 FString FVeloCEFConnection::GetURL() const { return Impl->LastURL; }
 FString FVeloCEFConnection::GetTitle() const { return Impl->LastTitle; }
+void FVeloCEFConnection::SetOnBrowserMessage(FOnBrowserMessage Callback) { Impl->OnBrowserMessage = MoveTemp(Callback); }
 
 #if PLATFORM_WINDOWS
 #define VELO_CEF_SEND(Command, Payload) return Impl->Send(VeloWebView::Protocol::EMessageType::Command, Payload)

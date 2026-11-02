@@ -7,13 +7,17 @@
 // shared-texture copy/IPC transport is the next layer behind this seam.
 
 #include "BrowserProtocol/BrowserProtocol.h"
+#include "JavaScriptBridge/BridgeScript.h"
 
 #include "include/cef_app.h"
 #include "include/cef_client.h"
+#include "include/cef_parser.h"
+#include "include/cef_process_message.h"
+#include "include/cef_render_process_handler.h"
 #include "include/cef_display_handler.h"
 #include "include/cef_load_handler.h"
 #include "include/cef_render_handler.h"
-#include "include/cef_parser.h"
+#include "include/cef_v8.h"
 #include "include/wrapper/cef_helpers.h"
 
 #include <windows.h>
@@ -23,11 +27,13 @@
 #endif
 
 #include <atomic>
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -52,6 +58,7 @@ struct FOptions
   int Height = 720;
   int FrameRate = 60;
   std::uint32_t InstanceId = 0;
+  bool EnableJavaScript = true;
   bool DisableGpu = false;
   bool EnableDevTools = false;
   bool AllowMediaCapture = false;
@@ -118,6 +125,7 @@ FOptions ParseOptions(int Argc, wchar_t** Argv)
   Options.Width = ParseInt(GetArgument(Argc, Argv, L"--width"), Options.Width, 1, 16384);
   Options.Height = ParseInt(GetArgument(Argc, Argv, L"--height"), Options.Height, 1, 16384);
   Options.FrameRate = ParseInt(GetArgument(Argc, Argv, L"--fps"), Options.FrameRate, 1, 120);
+  Options.EnableJavaScript = GetArgument(Argc, Argv, L"--javascript-enabled") != L"0";
   Options.InstanceId = static_cast<std::uint32_t>(ParseInt(
       GetArgument(Argc, Argv, L"--instance-id"), 0, 0, 0x7fffffff));
   Options.DisableGpu = HasFlag(Argc, Argv, L"--disable-gpu");
@@ -250,28 +258,97 @@ public:
     Rect = CefRect(0, 0, Width.load(std::memory_order_relaxed), Height.load(std::memory_order_relaxed));
   }
 
-  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType Type,
-               const RectList& DirtyRects, const void* Buffer, int InWidth, int InHeight) override
+  bool GetScreenInfo(CefRefPtr<CefBrowser> Browser, CefScreenInfo& Info) override
   {
-    // CPU pixels are intentionally not sent through the control pipe.  This is
-    // only a compatibility/fallback signal until the shared-memory ring is
-    // connected.  The production path must remain GPU -> GPU.
-    if (Type != PET_VIEW)
+    // The OSR surface and pipe input both use browser pixels. Keep popup
+    // placement within that virtual screen, independent of desktop DPI.
+    Info.device_scale_factor = 1.0f;
+    CefRect Rect;
+    GetViewRect(Browser, Rect);
+    Info.rect = Rect;
+    Info.available_rect = Info.rect;
+    return true;
+  }
+
+  void OnPopupShow(CefRefPtr<CefBrowser>, bool Show) override
+  {
+    if (Show)
+    {
+      bPopupVisible = true;
+      PopupPixels.clear();
+    }
+    else
+    {
+      ResetPopup();
+    }
+  }
+
+  void ResetPopup()
+  {
+    bPopupVisible = false;
+    PopupRect = CefRect();
+    PopupPixels.clear();
+    // A static page need not repaint when its popup closes. Republish the
+    // clean view immediately so the last dropdown cannot remain in Slate.
+    PublishCpuFrame();
+  }
+
+  void OnPopupSize(CefRefPtr<CefBrowser>, const CefRect& Rect) override
+  {
+    PopupRect = Rect;
+    PopupPixels.clear();
+    PublishCpuFrame();
+  }
+
+  bool IsOverPopup(int X, int Y) const
+  {
+    const CefRect Rect = GetPopupRect();
+    return bPopupVisible && X >= Rect.x && Y >= Rect.y &&
+        X < Rect.x + Rect.width && Y < Rect.y + Rect.height;
+  }
+
+  bool HasPopupOffset() const
+  {
+    const CefRect Rect = GetPopupRect();
+    return Rect.x != PopupRect.x || Rect.y != PopupRect.y;
+  }
+
+  void ApplyPopupOffset(CefMouseEvent& Event) const
+  {
+    if (IsOverPopup(Event.x, Event.y))
+    {
+      const CefRect Rect = GetPopupRect();
+      Event.x += PopupRect.x - Rect.x;
+      Event.y += PopupRect.y - Rect.y;
+    }
+  }
+
+  void OnPaint(CefRefPtr<CefBrowser>, PaintElementType Type,
+               const RectList&, const void* Buffer, int InWidth, int InHeight) override
+  {
+    if (!Buffer || InWidth <= 0 || InHeight <= 0)
     {
       return;
     }
-    Protocol::FFrameSlot Frame;
-    Frame.Sequence = ++Sequence;
-    Frame.FrameId = Frame.Sequence;
-    Frame.TimestampUs = NowMicros();
-    Frame.Width = static_cast<std::uint32_t>(InWidth);
-    Frame.Height = static_cast<std::uint32_t>(InHeight);
-    Frame.Format = 1; // BGRA8 premultiplied
-    Frame.Flags = Protocol::FrameCpuFallback |
-        (DirtyRects.empty() ? 0u : Protocol::FrameHasDirtyRect);
-    Frame.PixelBytes = static_cast<std::uint32_t>(InWidth * InHeight * 4ull);
-    bReceivedGpuFrame.store(false, std::memory_order_release);
-    PublishFrame(Frame, Buffer);
+    const auto* Pixels = static_cast<const std::uint8_t*>(Buffer);
+    const std::size_t Bytes = static_cast<std::size_t>(InWidth) * InHeight * 4;
+    if (Type == PET_VIEW)
+    {
+      ViewWidth = InWidth;
+      ViewHeight = InHeight;
+      ViewPixels.assign(Pixels, Pixels + Bytes);
+    }
+    else if (Type == PET_POPUP && bPopupVisible)
+    {
+      PopupWidth = InWidth;
+      PopupHeight = InHeight;
+      PopupPixels.assign(Pixels, Pixels + Bytes);
+    }
+    else
+    {
+      return;
+    }
+    PublishCpuFrame();
   }
 
 #if defined(VELO_CEF_LEGACY_ACCELERATED_PAINT)
@@ -297,11 +374,74 @@ public:
     // otherwise a larger OnPaint frame could overrun the shared slot.
     const int MaxWidth = Ring ? static_cast<int>(Ring->GetWidth()) : InWidth;
     const int MaxHeight = Ring ? static_cast<int>(Ring->GetHeight()) : InHeight;
-    Width.store(std::max(1, std::min(InWidth, MaxWidth)), std::memory_order_relaxed);
-    Height.store(std::max(1, std::min(InHeight, MaxHeight)), std::memory_order_relaxed);
+    const int NewWidth = std::max(1, std::min(InWidth, MaxWidth));
+    const int NewHeight = std::max(1, std::min(InHeight, MaxHeight));
+    if (NewWidth != Width.load() || NewHeight != Height.load())
+    {
+      bPopupVisible = false;
+      PopupRect = CefRect();
+      PopupPixels.clear();
+      ViewPixels.clear();
+    }
+    Width.store(NewWidth, std::memory_order_relaxed);
+    Height.store(NewHeight, std::memory_order_relaxed);
   }
 
 private:
+  CefRect GetPopupRect() const
+  {
+    CefRect Rect = PopupRect;
+    Rect.x = std::max(0, std::min(Rect.x, Width.load() - Rect.width));
+    Rect.y = std::max(0, std::min(Rect.y, Height.load() - Rect.height));
+    return Rect;
+  }
+
+  void PublishCpuFrame()
+  {
+    if (ViewPixels.empty()) return;
+
+    const void* Pixels = ViewPixels.data();
+    if (bPopupVisible && !PopupPixels.empty())
+    {
+      // PET_POPUP is a separate premultiplied BGRA surface (native select
+      // options). Preserve the clean view for independent paints and hiding.
+      CompositedPixels = ViewPixels;
+      const CefRect Rect = GetPopupRect();
+      const int CopyWidth = std::max(0, std::min({PopupWidth, Rect.width, ViewWidth - Rect.x}));
+      const int CopyHeight = std::max(0, std::min({PopupHeight, Rect.height, ViewHeight - Rect.y}));
+      for (int Y = 0; Y < CopyHeight; ++Y)
+      {
+        auto* Dest = CompositedPixels.data() +
+            (static_cast<std::size_t>(Rect.y + Y) * ViewWidth + Rect.x) * 4;
+        const auto* Source = PopupPixels.data() + static_cast<std::size_t>(Y) * PopupWidth * 4;
+        for (int X = 0; X < CopyWidth; ++X, Dest += 4, Source += 4)
+        {
+          const unsigned InverseAlpha = 255u - Source[3];
+          for (int Channel = 0; Channel < 4; ++Channel)
+          {
+            Dest[Channel] = static_cast<std::uint8_t>(std::min(255u,
+                Source[Channel] + (Dest[Channel] * InverseAlpha + 127u) / 255u));
+          }
+        }
+      }
+      Pixels = CompositedPixels.data();
+    }
+
+    Protocol::FFrameSlot Frame;
+    Frame.Sequence = ++Sequence;
+    Frame.FrameId = Frame.Sequence;
+    Frame.TimestampUs = NowMicros();
+    Frame.Width = static_cast<std::uint32_t>(ViewWidth);
+    Frame.Height = static_cast<std::uint32_t>(ViewHeight);
+    Frame.Format = 1;
+    // Always publish a full view-sized frame. No popup-specific IPC or Slate
+    // overlay is needed, so UMG clipping and pointer coordinates still match.
+    Frame.Flags = Protocol::FrameCpuFallback;
+    Frame.PixelBytes = static_cast<std::uint32_t>(ViewPixels.size());
+    bReceivedGpuFrame.store(false, std::memory_order_release);
+    PublishFrame(Frame, Pixels);
+  }
+
   void PublishAccelerated(PaintElementType Type, const RectList& DirtyRects,
                           std::uintptr_t SharedHandle)
   {
@@ -345,7 +485,116 @@ private:
   std::atomic<bool> bReceivedGpuFrame{false};
   Protocol::FFrameSlot LastFrame{};
   std::shared_ptr<FFrameRing> Ring;
+  // CefRenderHandler callbacks and pipe command tasks run on CEF's UI thread.
+  bool bPopupVisible = false;
+  CefRect PopupRect;
+  int ViewWidth = 0;
+  int ViewHeight = 0;
+  int PopupWidth = 0;
+  int PopupHeight = 0;
+  std::vector<std::uint8_t> ViewPixels;
+  std::vector<std::uint8_t> PopupPixels;
+  std::vector<std::uint8_t> CompositedPixels;
   IMPLEMENT_REFCOUNTING(FRenderHandler);
+};
+
+// CEF callbacks never perform pipe I/O. Keep a bounded queue so a slow or
+// disconnected Unreal consumer cannot block the browser's UI thread.
+class FBrowserEvents
+{
+public:
+  explicit FBrowserEvents(std::uint32_t InInstanceId) : InstanceId(InInstanceId) {}
+
+  void Publish(EMessageType Type, const std::string& Payload)
+  {
+    if (Payload.size() > Protocol::kMaxMessageBytes - sizeof(Protocol::FMessageHeader)) return;
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (Packets.size() >= 1024 || QueuedBytes + Payload.size() > 4 * Protocol::kMaxMessageBytes) return;
+    Protocol::FMessageHeader Header;
+    Header.Type = static_cast<std::uint16_t>(Type);
+    Header.Size += static_cast<std::uint32_t>(Payload.size());
+    Header.InstanceId = InstanceId;
+    Header.Sequence = ++Sequence;
+    std::string Packet(sizeof(Header), '\0');
+    std::memcpy(Packet.data(), &Header, sizeof(Header));
+    Packet += Payload;
+    QueuedBytes += Packet.size();
+    Packets.push_back(std::move(Packet));
+  }
+
+  bool Pop(std::string& Packet)
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    if (Packets.empty()) return false;
+    Packet = std::move(Packets.front());
+    Packets.pop_front();
+    QueuedBytes -= Packet.size();
+    return true;
+  }
+
+  std::uint32_t GetInstanceId() const { return InstanceId; }
+  bool HasPending() const
+  {
+    std::lock_guard<std::mutex> Lock(Mutex);
+    return !Packets.empty();
+  }
+
+private:
+  const std::uint32_t InstanceId;
+  std::uint64_t Sequence = 0;
+  std::size_t QueuedBytes = 0;
+  mutable std::mutex Mutex;
+  std::deque<std::string> Packets;
+};
+
+class FRenderProcessHandler final : public CefRenderProcessHandler,
+                                    public CefV8Handler
+{
+public:
+  void OnContextCreated(CefRefPtr<CefBrowser> Browser, CefRefPtr<CefFrame> Frame,
+                        CefRefPtr<CefV8Context> Context) override
+  {
+    if (!Frame->IsMain()) return;
+    const auto Global = Context->GetGlobal();
+    Global->SetValue("__veloPostMessage",
+                     CefV8Value::CreateFunction("__veloPostMessage", this),
+                     V8_PROPERTY_ATTRIBUTE_DONTDELETE);
+    Global->SetValue("__veloNativePostMessage",
+                     CefV8Value::CreateFunction("__veloNativePostMessage", this),
+                     V8_PROPERTY_ATTRIBUTE_DONTDELETE);
+    CefRefPtr<CefV8Value> Result;
+    CefRefPtr<CefV8Exception> Exception;
+    if (!Context->Eval(VeloWebView::JavaScriptBridgeSource, Frame->GetURL(), 0, Result, Exception))
+      std::wcerr << L"[VeloWebViewBrowserHost] bridge injection failed: "
+                 << (Exception ? Exception->GetMessage().ToWString() : L"unknown error") << std::endl;
+  }
+
+  bool Execute(const CefString& Name, CefRefPtr<CefV8Value> Object,
+               const CefV8ValueList& Arguments, CefRefPtr<CefV8Value>& ReturnValue,
+               CefString& Exception) override
+  {
+    if ((Name != "__veloPostMessage" && Name != "__veloNativePostMessage") || Arguments.size() != 1 ||
+        !Arguments[0]->IsString())
+    {
+      Exception = "__veloPostMessage requires one string argument";
+      return true;
+    }
+    const auto Context = CefV8Context::GetCurrentContext();
+    const auto Frame = Context ? Context->GetFrame() : nullptr;
+    if (!Frame || !Frame->IsMain()) return true;
+    if (Arguments[0]->GetStringValue().ToString().size() > Protocol::kMaxMessageBytes - sizeof(Protocol::FMessageHeader))
+    {
+      Exception = "VeloWebView message exceeds the transport size limit";
+      return true;
+    }
+    const auto Message = CefProcessMessage::Create("VeloWebView.JavaScriptMessage");
+    Message->GetArgumentList()->SetString(0, Arguments[0]->GetStringValue());
+    Frame->SendProcessMessage(PID_BROWSER, Message);
+    return true;
+  }
+
+private:
+  IMPLEMENT_REFCOUNTING(FRenderProcessHandler);
 };
 
 class FClient final : public CefClient,
@@ -354,8 +603,8 @@ class FClient final : public CefClient,
                       public CefDisplayHandler
 {
 public:
-  explicit FClient(CefRefPtr<FRenderHandler> InRenderHandler)
-      : RenderHandler(std::move(InRenderHandler))
+  FClient(CefRefPtr<FRenderHandler> InRenderHandler, std::shared_ptr<FBrowserEvents> InEvents)
+      : RenderHandler(std::move(InRenderHandler)), Events(std::move(InEvents))
   {
   }
 
@@ -375,29 +624,71 @@ public:
   {
     Browser = nullptr;
     bClosed.store(true, std::memory_order_release);
+    CefQuitMessageLoop();
   }
 
-  void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, TransitionType) override
+  void OnLoadStart(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> Frame, TransitionType) override
   {
+    if (Frame->IsMain())
+    {
+      RenderHandler->ResetPopup();
+      Events->Publish(EMessageType::PageStarted, Frame->GetURL().ToString());
+    }
     std::wcerr << L"[VeloWebViewBrowserHost] load started" << std::endl;
   }
 
   void OnLoadEnd(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> Frame, int HttpStatusCode) override
   {
+    if (Frame->IsMain()) Events->Publish(EMessageType::PageLoaded, Frame->GetURL().ToString());
     std::wcerr << L"[VeloWebViewBrowserHost] load end status=" << HttpStatusCode
                << L" url=" << Frame->GetURL().ToWString() << std::endl;
   }
 
-  void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, ErrorCode Code,
+  void OnLoadError(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> Frame, ErrorCode Code,
                   const CefString& Text, const CefString& FailedUrl) override
   {
+    if (Frame->IsMain() && Code != ERR_ABORTED)
+    {
+      const auto Error = CefDictionaryValue::Create();
+      Error->SetInt("code", static_cast<int>(Code));
+      Error->SetString("description", Text);
+      Error->SetString("url", FailedUrl);
+      Events->Publish(EMessageType::PageError, CefWriteJSON(CefValueFor(Error), JSON_WRITER_DEFAULT).ToString());
+    }
     std::wcerr << L"[VeloWebViewBrowserHost] load error code=" << static_cast<int>(Code)
                << L" url=" << FailedUrl.ToWString() << L" " << Text.ToWString() << std::endl;
   }
 
-  void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame>, const CefString& Url) override
+  void OnAddressChange(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> Frame, const CefString& Url) override
   {
+    if (Frame->IsMain()) Events->Publish(EMessageType::UrlChanged, Url.ToString());
     std::wcerr << L"[VeloWebViewBrowserHost] url=" << Url.ToWString() << std::endl;
+  }
+
+  void OnTitleChange(CefRefPtr<CefBrowser>, const CefString& Title) override
+  {
+    Events->Publish(EMessageType::TitleChanged, Title.ToString());
+  }
+
+  bool OnConsoleMessage(CefRefPtr<CefBrowser>, cef_log_severity_t, const CefString& Message,
+                        const CefString& Source, int Line) override
+  {
+    const auto Console = CefDictionaryValue::Create();
+    Console->SetString("message", Message);
+    Console->SetString("source", Source);
+    Console->SetInt("line", Line);
+    Events->Publish(EMessageType::ConsoleMessage, CefWriteJSON(CefValueFor(Console), JSON_WRITER_DEFAULT).ToString());
+    return false;
+  }
+
+  bool OnProcessMessageReceived(CefRefPtr<CefBrowser>, CefRefPtr<CefFrame> Frame,
+                                CefProcessId Source, CefRefPtr<CefProcessMessage> Message) override
+  {
+    if (Source != PID_RENDERER || !Frame->IsMain() || Message->GetName() != "VeloWebView.JavaScriptMessage") return false;
+    const auto Arguments = Message->GetArgumentList();
+    if (Arguments->GetSize() == 1 && Arguments->GetType(0) == VTYPE_STRING)
+      Events->Publish(EMessageType::JavaScriptMessage, Arguments->GetString(0).ToString());
+    return true;
   }
 
   bool IsClosed() const { return bClosed.load(std::memory_order_acquire); }
@@ -412,6 +703,9 @@ public:
     }
     switch (Type)
     {
+      case Protocol::EMessageType::Hello:
+        Events->Publish(EMessageType::HelloReply, "1");
+        break;
       case Protocol::EMessageType::LoadUrl:
         ActiveBrowser->GetMainFrame()->LoadURL(CefString(Payload));
         break;
@@ -441,12 +735,23 @@ public:
         char Comma = 0;
         Stream >> NewWidth >> Comma >> NewHeight >> Comma >> Scale;
         RenderHandler->SetSize(NewWidth, NewHeight);
+        ActiveBrowser->GetHost()->NotifyScreenInfoChanged();
         ActiveBrowser->GetHost()->WasResized();
         break;
       }
       case Protocol::EMessageType::SetFocus:
         ActiveBrowser->GetHost()->SetFocus(Payload == "1");
         break;
+      case Protocol::EMessageType::SetJavaScriptEnabled:
+      {
+        const auto Context = ActiveBrowser->GetHost()->GetRequestContext();
+        if (Context)
+        {
+          Context->SetContentSetting("", "", CEF_CONTENT_SETTING_TYPE_JAVASCRIPT,
+              Payload == "1" ? CEF_CONTENT_SETTING_VALUE_ALLOW : CEF_CONTENT_SETTING_VALUE_BLOCK);
+        }
+        break;
+      }
       case Protocol::EMessageType::SetVisibility:
         ActiveBrowser->GetHost()->WasHidden(Payload != "1");
         break;
@@ -457,6 +762,7 @@ public:
         std::memcpy(&Input, Payload.data(), sizeof(Input));
         CefMouseEvent Event;
         Event.x = Input.X; Event.y = Input.Y; Event.modifiers = Input.Modifiers;
+        RenderHandler->ApplyPopupOffset(Event);
         ActiveBrowser->GetHost()->SendMouseMoveEvent(Event, Input.Leave != 0);
         break;
       }
@@ -472,6 +778,18 @@ public:
         else break;
         CefMouseEvent Event;
         Event.x = Input.X; Event.y = Input.Y; Event.modifiers = Input.Modifiers;
+        if (!Input.MouseUp)
+        {
+          bMouseDownOnView = !RenderHandler->IsOverPopup(Event.x, Event.y);
+        }
+        else if (bMouseDownOnView && RenderHandler->IsOverPopup(Event.x, Event.y) &&
+                 RenderHandler->HasPopupOffset())
+        {
+          // Opening a repositioned popup must not select the option that now
+          // covers the select control when the initiating mouse-up arrives.
+          break;
+        }
+        RenderHandler->ApplyPopupOffset(Event);
         ActiveBrowser->GetHost()->SendMouseClickEvent(Event, Button, Input.MouseUp != 0,
                                                        std::max(1, static_cast<int>(Input.ClickCount)));
         break;
@@ -483,6 +801,7 @@ public:
         std::memcpy(&Input, Payload.data(), sizeof(Input));
         CefMouseEvent Event;
         Event.x = Input.X; Event.y = Input.Y; Event.modifiers = Input.Modifiers;
+        RenderHandler->ApplyPopupOffset(Event);
         ActiveBrowser->GetHost()->SendMouseWheelEvent(Event, Input.DeltaX, Input.DeltaY);
         break;
       }
@@ -518,9 +837,17 @@ public:
   }
 
 private:
+  static CefRefPtr<CefValue> CefValueFor(CefRefPtr<CefDictionaryValue> Dictionary)
+  {
+    const auto Value = CefValue::Create();
+    Value->SetDictionary(Dictionary);
+    return Value;
+  }
   CefRefPtr<FRenderHandler> RenderHandler;
+  std::shared_ptr<FBrowserEvents> Events;
   CefRefPtr<CefBrowser> Browser;
   std::atomic<bool> bClosed{false};
+  bool bMouseDownOnView = false;
   IMPLEMENT_REFCOUNTING(FClient);
 };
 
@@ -557,8 +884,9 @@ private:
 class FPipeServer final
 {
 public:
-  FPipeServer(std::wstring InName, CefRefPtr<FClient> InClient)
-      : Name(std::move(InName)), Client(std::move(InClient))
+  FPipeServer(std::wstring InName, CefRefPtr<FClient> InClient,
+              std::shared_ptr<FBrowserEvents> InEvents)
+      : Name(std::move(InName)), Client(std::move(InClient)), Events(std::move(InEvents))
   {
   }
 
@@ -577,13 +905,6 @@ public:
   void Stop()
   {
     bStop.store(true, std::memory_order_release);
-    if (Pipe != INVALID_HANDLE_VALUE)
-    {
-      ::CancelIoEx(Pipe, nullptr);
-      ::DisconnectNamedPipe(Pipe);
-      ::CloseHandle(Pipe);
-      Pipe = INVALID_HANDLE_VALUE;
-    }
     if (Worker.joinable())
     {
       Worker.join();
@@ -598,7 +919,7 @@ private:
     {
       HANDLE NewPipe = ::CreateNamedPipeW(
           PipePath.c_str(), PIPE_ACCESS_DUPLEX,
-          PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+          PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT,
           1, Protocol::kMaxMessageBytes, Protocol::kMaxMessageBytes, 100,
           nullptr);
       if (NewPipe == INVALID_HANDLE_VALUE)
@@ -606,8 +927,14 @@ private:
         return;
       }
       Pipe = NewPipe;
-      const BOOL Connected = ::ConnectNamedPipe(NewPipe, nullptr) ||
-          ::GetLastError() == ERROR_PIPE_CONNECTED;
+      BOOL Connected = FALSE;
+      while (!bStop.load(std::memory_order_acquire))
+      {
+        Connected = ::ConnectNamedPipe(NewPipe, nullptr) || ::GetLastError() == ERROR_PIPE_CONNECTED;
+        if (Connected) break;
+        if (::GetLastError() != ERROR_PIPE_LISTENING) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
       if (!Connected)
       {
         ::CloseHandle(NewPipe);
@@ -615,30 +942,80 @@ private:
         continue;
       }
 
+      std::array<char, sizeof(Protocol::FMessageHeader)> HeaderBytes{};
+      std::size_t HeaderRead = 0;
+      Protocol::FMessageHeader IncomingHeader{};
+      std::string IncomingPayload;
+      std::size_t PayloadRead = 0;
+      std::string PendingWrite;
+      std::size_t WriteOffset = 0;
       while (!bStop.load(std::memory_order_acquire))
       {
-        Protocol::FMessageHeader Header{};
+        DWORD Available = 0;
+        if (!::PeekNamedPipe(NewPipe, nullptr, 0, nullptr, &Available, nullptr))
+        {
+          break;
+        }
+
         DWORD Read = 0;
-        if (!::ReadFile(NewPipe, &Header, sizeof(Header), &Read, nullptr) ||
-            Read != sizeof(Header))
+        if (HeaderRead < HeaderBytes.size() && Available > 0)
         {
-          break;
+          const DWORD Amount = static_cast<DWORD>(std::min<std::size_t>(Available, HeaderBytes.size() - HeaderRead));
+          if (!::ReadFile(NewPipe, HeaderBytes.data() + HeaderRead, Amount, &Read, nullptr)) break;
+          HeaderRead += Read;
+          Available -= Read;
         }
-        if (!Protocol::IsValid(Header, Header.Size))
+
+        if (HeaderRead == HeaderBytes.size() && IncomingPayload.empty() && PayloadRead == 0)
         {
-          break;
+          std::memcpy(&IncomingHeader, HeaderBytes.data(), sizeof(IncomingHeader));
+          if (!Protocol::IsValid(IncomingHeader, IncomingHeader.Size) ||
+              IncomingHeader.InstanceId != Events->GetInstanceId()) break;
+          const std::size_t PayloadBytes = IncomingHeader.Size - sizeof(IncomingHeader);
+          IncomingPayload.resize(PayloadBytes);
+          if (PayloadBytes == 0)
+          {
+            DispatchIncoming(IncomingHeader, IncomingPayload);
+            HeaderRead = 0;
+            IncomingPayload.clear();
+          }
         }
-        const std::uint32_t PayloadBytes = Header.Size - sizeof(Header);
-        std::string Payload(PayloadBytes, '\0');
-        if (PayloadBytes > 0 &&
-            (!::ReadFile(NewPipe, Payload.data(), PayloadBytes, &Read, nullptr) ||
-             Read != PayloadBytes))
+
+        if (HeaderRead == HeaderBytes.size() && IncomingPayload.size() > PayloadRead && Available > 0)
         {
-          break;
+          const DWORD Amount = static_cast<DWORD>(std::min<std::size_t>(Available, IncomingPayload.size() - PayloadRead));
+          if (!::ReadFile(NewPipe, IncomingPayload.data() + PayloadRead, Amount, &Read, nullptr)) break;
+          PayloadRead += Read;
+          if (PayloadRead == IncomingPayload.size())
+          {
+            DispatchIncoming(IncomingHeader, IncomingPayload);
+            HeaderRead = 0;
+            IncomingPayload.clear();
+            PayloadRead = 0;
+          }
         }
-        const auto Type = static_cast<Protocol::EMessageType>(Header.Type);
-        CefRefPtr<FClient> KeepClient = Client;
-        CefPostTask(TID_UI, new FCommandTask(KeepClient, Type, Payload));
+
+        bool bWroteAny = false;
+        if (PendingWrite.empty() || WriteOffset == PendingWrite.size())
+        {
+          PendingWrite.clear();
+          WriteOffset = 0;
+          Events->Pop(PendingWrite);
+        }
+        if (!PendingWrite.empty())
+        {
+          const DWORD Amount = static_cast<DWORD>(std::min<std::size_t>(PendingWrite.size() - WriteOffset, 64 * 1024));
+          if (::WriteFile(NewPipe, PendingWrite.data() + WriteOffset, Amount, &Read, nullptr))
+          {
+            bWroteAny = Read > 0;
+            WriteOffset += Read;
+          }
+          else if (::GetLastError() != ERROR_NO_DATA && ::GetLastError() != ERROR_PIPE_BUSY)
+            break;
+        }
+
+        if (Available == 0 && !bWroteAny)
+          std::this_thread::sleep_for(std::chrono::milliseconds(2));
       }
       ::DisconnectNamedPipe(NewPipe);
       ::CloseHandle(NewPipe);
@@ -646,8 +1023,16 @@ private:
     }
   }
 
+  void DispatchIncoming(const Protocol::FMessageHeader& Header, const std::string& Payload)
+  {
+    CefRefPtr<FClient> KeepClient = Client;
+    const auto Type = static_cast<Protocol::EMessageType>(Header.Type);
+    CefPostTask(TID_UI, new FCommandTask(KeepClient, Type, Payload));
+  }
+
   std::wstring Name;
   CefRefPtr<FClient> Client;
+  std::shared_ptr<FBrowserEvents> Events;
   std::thread Worker;
   std::atomic<bool> bStop{false};
   HANDLE Pipe = INVALID_HANDLE_VALUE;
@@ -681,10 +1066,13 @@ public:
     }
   }
 
+  CefRefPtr<CefRenderProcessHandler> GetRenderProcessHandler() override { return RenderHandler; }
+
 private:
   bool bDisableGpu = false;
   bool bAllowMediaCapture = false;
   bool bEnablePixelStreaming = false;
+  CefRefPtr<FRenderProcessHandler> RenderHandler = new FRenderProcessHandler();
   IMPLEMENT_REFCOUNTING(FApp);
 };
 
@@ -727,6 +1115,10 @@ int RunBrowser(const CefMainArgs& Args, const FOptions& Options)
     return CefGetExitCode();
   }
 
+  CefRequestContext::GetGlobalContext()->SetContentSetting(
+      "", "", CEF_CONTENT_SETTING_TYPE_JAVASCRIPT,
+      Options.EnableJavaScript ? CEF_CONTENT_SETTING_VALUE_ALLOW : CEF_CONTENT_SETTING_VALUE_BLOCK);
+
   CefWindowInfo WindowInfo;
   WindowInfo.SetAsWindowless(nullptr);
   WindowInfo.shared_texture_enabled = Options.DisableGpu ? 0 : 1;
@@ -746,8 +1138,9 @@ int RunBrowser(const CefMainArgs& Args, const FOptions& Options)
   }
   CefRefPtr<FRenderHandler> RenderHandler =
       new FRenderHandler(Options.Width, Options.Height, Options.InstanceId, FrameRing);
-  CefRefPtr<FClient> Client = new FClient(RenderHandler);
-  FPipeServer PipeServer(Options.PipeName, Client);
+  auto BrowserEvents = std::make_shared<FBrowserEvents>(Options.InstanceId);
+  CefRefPtr<FClient> Client = new FClient(RenderHandler, BrowserEvents);
+  FPipeServer PipeServer(Options.PipeName, Client, BrowserEvents);
   if (!Options.PipeName.empty() && !PipeServer.Start())
   {
     std::wcerr << L"[VeloWebViewBrowserHost] unable to create control pipe" << std::endl;
@@ -766,9 +1159,7 @@ int RunBrowser(const CefMainArgs& Args, const FOptions& Options)
     Browser->GetHost()->ShowDevTools(CefWindowInfo(), Client, CefBrowserSettings(), CefPoint());
   }
 
-  // The first transport milestone is deliberately explicit: CEF owns the
-  // frame callback; IPC/shared-texture ring integration is added behind the
-  // protocol boundary without changing the UMG-facing API.
+  // The pipe remains active while CEF pumps its normal browser and renderer events.
   CefRunMessageLoop();
   if (CefRefPtr<CefBrowser> ActiveBrowser = Client->GetBrowser())
   {
@@ -792,15 +1183,17 @@ int APIENTRY wWinMain(HINSTANCE Instance, HINSTANCE, LPWSTR, int)
   // On Windows CEF's CefMainArgs intentionally takes the module instance;
   // CEF reads the full command line itself for subprocess dispatch.
   CefMainArgs MainArgs(Instance);
-  const int SubprocessExitCode = CefExecuteProcess(MainArgs, nullptr, nullptr);
+  const VeloWebView::BrowserHost::FOptions Options =
+      VeloWebView::BrowserHost::ParseOptions(Argc, WideArgv);
+  CefRefPtr<VeloWebView::BrowserHost::FApp> App = new VeloWebView::BrowserHost::FApp(
+      Options.DisableGpu, Options.AllowMediaCapture, Options.EnablePixelStreaming);
+  const int SubprocessExitCode = CefExecuteProcess(MainArgs, App, nullptr);
   if (SubprocessExitCode >= 0)
   {
     ::LocalFree(WideArgv);
     return SubprocessExitCode;
   }
 
-  const VeloWebView::BrowserHost::FOptions Options =
-      VeloWebView::BrowserHost::ParseOptions(Argc, WideArgv);
   const int ExitCode = VeloWebView::BrowserHost::RunBrowser(MainArgs, Options);
   ::LocalFree(WideArgv);
   return ExitCode;

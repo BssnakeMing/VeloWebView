@@ -23,6 +23,7 @@ public class VeloWebView : ModuleRules
 			"ApplicationCore",
 			"InputCore",
 			"Slate",
+			"Json",
 			"Projects"
 		});
 

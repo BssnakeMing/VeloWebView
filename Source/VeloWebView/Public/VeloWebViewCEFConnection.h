@@ -22,6 +22,7 @@ struct VELOWEBVIEW_API FVeloCEFConnectionConfig
 	int32 FrameRate = 60;
 	/** Until the D3D12 bridge is enabled, force CEF's CPU ring so Slate can display frames. */
 	bool bDisableGPU = true;
+	bool bEnableJavaScript = true;
 	bool bAllowMediaCapture = false;
 	bool bEnablePixelStreaming = false;
 };
@@ -37,6 +38,8 @@ struct VELOWEBVIEW_API FVeloCEFConnectionConfig
 class VELOWEBVIEW_API FVeloCEFConnection : public TSharedFromThis<FVeloCEFConnection>
 {
 public:
+	using FOnBrowserMessage = TFunction<void(uint16 Type, const FString& Payload)>;
+
 	FVeloCEFConnection();
 	~FVeloCEFConnection();
 
@@ -55,6 +58,8 @@ public:
 	FString GetLastError() const;
 	FString GetURL() const;
 	FString GetTitle() const;
+	/** Browser event messages are consumed during Tick on the caller's thread. */
+	void SetOnBrowserMessage(FOnBrowserMessage Callback);
 
 	bool LoadURL(const FString& URL);
 	bool LoadHTML(const FString& HTML, const FString& BaseURL);

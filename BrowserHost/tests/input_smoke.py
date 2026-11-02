@@ -44,7 +44,7 @@ document.getElementById('range').oninput=e=>{if(Number(e.target.value)>70)mark('
 
 
 class Host:
-    def __init__(self, executable):
+    def __init__(self, executable, url=None):
         self.kernel = ctypes.WinDLL("kernel32", use_last_error=True)
         k = self.kernel
         k.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
@@ -66,12 +66,13 @@ class Host:
         self.pipe = None
         self.mapping = None
         self.view = None
-        self.temp = tempfile.TemporaryDirectory(prefix="VeloInputSmoke_")
+        # CEF/crashpad can retain a log handle briefly after forced shutdown.
+        self.temp = tempfile.TemporaryDirectory(prefix="VeloInputSmoke_", ignore_cleanup_errors=True)
         self.process = subprocess.Popen([
             str(executable), "--disable-gpu", "--width=640", "--height=480",
             "--instance-id=%d" % self.instance, "--pipe=" + self.pipe_name,
             "--cache-path=" + self.temp.name,
-            "--url=data:text/html;base64," + base64.b64encode(HTML.encode()).decode()
+            "--url=" + (url if url is not None else "data:text/html;base64," + base64.b64encode(HTML.encode()).decode())
         ], cwd=str(executable.parent), creationflags=subprocess.CREATE_NO_WINDOW)
 
     def connect(self):
@@ -179,9 +180,19 @@ def main():
     host = Host(args.host.resolve())
     try:
         host.connect()
-        host.send(12, b"1")
         # Wait until DOM content is painted, then check real user-input behavior.
-        time.sleep(1)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            frame = host.frame()
+            if frame:
+                pixels, width, height = frame
+                offset = 4 * (428 * width + 18)
+                if width == 640 and height == 480 and pixels[offset:offset + 4] == bytes.fromhex("333377ff"):
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("Input test page did not paint")
+        host.send(12, b"1")
         host.send(24, struct.pack("<iiIB3x", 100, 40, 0, 0)); host.wait("move")
         host.click(100, 40); host.wait("click")
         host.click(100, 40, button=2); host.wait("right")

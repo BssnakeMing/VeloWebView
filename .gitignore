@@ -21,3 +21,5 @@ BrowserHost/*.dll
 
 # Local runtime/test logs
 *.log
+__pycache__/
+*.py[cod]

@@ -2,6 +2,7 @@
 
 #include "CoreMinimal.h"
 #include "Components/Widget.h"
+#include "Containers/Ticker.h"
 #include "VeloWebViewTypes.h"
 #include "VeloWebViewCEFConnection.h"
 #include "VeloWebView.generated.h"
@@ -22,6 +23,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVeloWebViewPageError, const FVeloWe
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVeloWebViewURLChanged, const FString&, URL);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVeloWebViewTitleChanged, const FString&, Title);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVeloWebViewJavaScriptMessage, const FString&, Message);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVeloWebViewJavaScriptBridgeReady);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FVeloWebViewJavaScriptRequest, const FString&, RequestId, const FString&, Method, const FString&, ParametersJSON);
+DECLARE_DYNAMIC_DELEGATE_ThreeParams(FVeloWebViewJavaScriptResult, bool, bSuccess, const FString&, ResultJSON, const FString&, Error);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FVeloWebViewConsoleMessage, const FString&, Message, const FString&, Source, int32, Line);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FVeloWebViewDownloadRequested, const FString&, URL, const FString&, SuggestedFilename, const FString&, MimeType);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVeloWebViewPermissionRequested, EVeloWebViewPermission, Permission, const FString&, Origin);
@@ -95,6 +99,12 @@ public:
 	FVeloWebViewTitleChanged OnTitleChanged;
 	UPROPERTY(BlueprintAssignable, Category = "VeloWebView|Events")
 	FVeloWebViewJavaScriptMessage OnJavaScriptMessage;
+	/** Fired once the current main document can receive messages and evaluate requests. */
+	UPROPERTY(BlueprintAssignable, Category = "VeloWebView|JavaScript")
+	FVeloWebViewJavaScriptBridgeReady OnJavaScriptBridgeReady;
+	/** Handle window.VeloWebView.request(), then call RespondToJavaScript or RejectJavaScriptRequest. */
+	UPROPERTY(BlueprintAssignable, Category = "VeloWebView|JavaScript")
+	FVeloWebViewJavaScriptRequest OnJavaScriptRequest;
 	UPROPERTY(BlueprintAssignable, Category = "VeloWebView|Events")
 	FVeloWebViewConsoleMessage OnConsoleMessage;
 	UPROPERTY(BlueprintAssignable, Category = "VeloWebView|Events")
@@ -142,6 +152,28 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
 	void ExecuteJavaScript(const FString& Script);
+
+	/** Evaluate a main-document expression, await a returned Promise and report a JSON value or error. */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript", meta = (AutoCreateRefTerm = "Callback", AdvancedDisplay = "TimeoutSeconds"))
+	FString ExecuteJavaScriptWithResult(const FString& Script, const FVeloWebViewJavaScriptResult& Callback, float TimeoutSeconds = 30.0f);
+
+	/** Send a string as event.data to VeloWebView.onmessage / addEventListener('message', ...). */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
+	bool PostMessageToJavaScript(const FString& Message);
+
+	/** Send a JSON value as event.data. Invalid JSON is rejected without executing script. */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
+	bool PostJSONToJavaScript(const FString& MessageJSON);
+
+	/** Resolve a pending page request with a JSON value (use null for no value). */
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
+	bool RespondToJavaScript(const FString& RequestId, const FString& ResultJSON);
+
+	UFUNCTION(BlueprintCallable, Category = "VeloWebView|JavaScript")
+	bool RejectJavaScriptRequest(const FString& RequestId, const FString& Error);
+
+	UFUNCTION(BlueprintPure, Category = "VeloWebView|JavaScript")
+	bool IsJavaScriptBridgeReady() const;
 
 	/**
 	 * Updates the iframe owned by Content/Host.html.  This is a convenience
@@ -239,6 +271,7 @@ private:
 	void HandleFullscreenChanged(bool bIsFullscreen);
 	void HandleBeforeNavigate(const FString& URL);
 	void HandleNewWindowRequested(const FString& URL, bool bIsUserInitiated);
+	void HandleBrowserHostMessage(uint16 Type, const FString& Payload);
 
 	void EnsurePlatform();
 	#if PLATFORM_ANDROID
@@ -249,6 +282,21 @@ private:
 	void UpdateCompositedCEFFrame(const TArray<uint8>& Pixels, const FIntPoint& Size, uint64 Sequence);
 	UTexture2D* GetCompositedCEFTexture() const { return CompositedTexture; }
 	void QueueOrExecute(TFunction<void(IVeloWebViewPlatform&)> Action);
+	bool SendJavaScriptBridgePacket(const TSharedRef<class FJsonObject>& Packet);
+	bool TryExecuteBridgeScript(const FString& Script);
+	void ResetJavaScriptBridge(const FString& Reason);
+	void EnsureJavaScriptTicker();
+	bool TickJavaScriptRequests(float DeltaSeconds);
+	struct FPendingJavaScriptResult
+	{
+		FVeloWebViewJavaScriptResult Callback;
+		double Deadline = 0;
+	};
+	TMap<FString, FPendingJavaScriptResult> PendingJavaScriptResults;
+	TMap<FString, double> PendingJavaScriptRequests;
+	FTSTicker::FDelegateHandle JavaScriptTicker;
+	bool bJavaScriptBridgeReady = false;
+	FString JavaScriptBridgeSession;
 
 	TSharedPtr<SVeloWebView> MyWebViewWidget;
 	TSharedPtr<IVeloWebViewPlatform> Platform;

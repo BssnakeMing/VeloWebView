@@ -11,6 +11,7 @@ public class VeloWebViewAndroid : ModuleRules
 	public VeloWebViewAndroid(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
+		PrivateIncludePaths.Add(Path.GetFullPath(Path.Combine(ModuleDirectory, "../../Shared")));
 
 		PublicDependencyModuleNames.AddRange(
 			new string[]

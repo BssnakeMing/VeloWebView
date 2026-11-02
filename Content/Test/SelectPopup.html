@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>VeloWebView select popup regression</title>
+<style>
+  body { margin: 0; background: #14243e; color: white; font: 16px sans-serif; }
+  select { position: absolute; width: 220px; height: 36px; font: 16px sans-serif; }
+  option { background: #eef2f7; color: #102030; }
+  option[value="red"] { background: #e53b5a; }
+  option[value="green"] { background: #39c58a; }
+  option[value="blue"] { background: #478dff; }
+  #normal { left: 40px; top: 50px; }
+  #edge { right: 4px; bottom: 4px; }
+  #ready, #changed, #underlay { position: absolute; width: 20px; height: 20px; }
+  #ready { left: 4px; top: 4px; background: #33cc66; }
+  #changed { left: 300px; top: 4px; background: #773333; }
+  #underlay { left: 80px; top: 115px; background: #14243e; }
+  p { position: absolute; left: 40px; top: 220px; pointer-events: none; }
+</style>
+<div id="ready"></div><div id="changed"></div><div id="underlay"></div>
+<select id="normal" aria-label="Normal select">
+  <option value="">Choose an option</option>
+  <option value="red">Red option</option>
+  <option value="green">Green option</option>
+  <option value="blue">Blue option</option>
+</select>
+<select id="edge" aria-label="Select at viewport edge">
+  <option value="">Choose an option</option>
+  <option value="red">Red option</option>
+  <option value="green">Green option</option>
+  <option value="blue">Blue option</option>
+</select>
+<p>Open either select, choose Green, then reopen and dismiss with Escape.<br>
+The lower select checks popup placement near the viewport boundary.</p>
+<script>
+  document.querySelectorAll('select').forEach(select => {
+    select.onchange = () => {
+      document.getElementById('changed').style.background =
+        select.value === 'green' ? '#33cc66' : '#773333';
+    };
+  });
+</script>
+</html>

@@ -1,9 +1,13 @@
 #include "VeloWebView.h"
 
+#include "BrowserProtocol/BrowserProtocol.h"
+
 #include "Async/Async.h"
 #include "Engine/Texture2D.h"
 #include "IVeloWebViewPlatform.h"
 #include "Modules/ModuleManager.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
 #include "SVeloWebView.h"
 #if PLATFORM_ANDROID
 #include "SWebBrowserView.h"
@@ -231,6 +235,51 @@ void UVeloWebView::QueueOrExecute(TFunction<void(IVeloWebViewPlatform&)> Action)
 	}
 }
 
+void UVeloWebView::HandleBrowserHostMessage(uint16 Type, const FString& Payload)
+{
+	UE_LOG(LogVeloWebView, VeryVerbose, TEXT("BrowserHost event type=%u characters=%d"), Type, Payload.Len());
+	using VeloWebView::Protocol::EMessageType;
+	switch (static_cast<EMessageType>(Type))
+	{
+	case EMessageType::PageStarted: HandlePageStarted(Payload); break;
+	case EMessageType::PageLoaded: HandlePageLoaded(Payload); break;
+	case EMessageType::PageError:
+	{
+		TSharedPtr<FJsonObject> Json;
+		if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Payload), Json) && Json.IsValid())
+		{
+			double Code = -1;
+			FString Description;
+			FString URL;
+			Json->TryGetNumberField(TEXT("code"), Code);
+			Json->TryGetStringField(TEXT("description"), Description);
+			Json->TryGetStringField(TEXT("url"), URL);
+			HandlePageError(FVeloWebViewError(FMath::RoundToInt(Code), Description, URL));
+		}
+		break;
+	}
+	case EMessageType::UrlChanged: HandleURLChanged(Payload); break;
+	case EMessageType::TitleChanged: HandleTitleChanged(Payload); break;
+	case EMessageType::JavaScriptMessage: HandleJavaScriptMessage(Payload); break;
+	case EMessageType::ConsoleMessage:
+	{
+		TSharedPtr<FJsonObject> Json;
+		if (FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Payload), Json) && Json.IsValid())
+		{
+			FString Message;
+			FString Source;
+			double Line = 0;
+			Json->TryGetStringField(TEXT("message"), Message);
+			Json->TryGetStringField(TEXT("source"), Source);
+			Json->TryGetNumberField(TEXT("line"), Line);
+			HandleConsoleMessage(Message, Source, FMath::RoundToInt(Line));
+		}
+		break;
+	}
+	default: break;
+	}
+}
+
 #if PLATFORM_WINDOWS
 void UVeloWebView::EnsureCompositedCEF(FIntPoint InitialSize)
 {
@@ -241,9 +290,19 @@ void UVeloWebView::EnsureCompositedCEF(FIntPoint InitialSize)
 	if (!CEFConnection.IsValid())
 	{
 		CEFConnection = MakeShared<FVeloCEFConnection>();
+		CEFConnection->SetOnBrowserMessage([WeakThis = TWeakObjectPtr<UVeloWebView>(this),
+			WeakConnection = TWeakPtr<FVeloCEFConnection>(CEFConnection)](uint16 Type, const FString& Payload)
+		{
+			VeloWebViewPrivate::DispatchToGameThread(WeakThis, [WeakConnection, Type, Payload](UVeloWebView& Widget)
+			{
+				const TSharedPtr<FVeloCEFConnection> Connection = WeakConnection.Pin();
+				if (Connection && Widget.CEFConnection == Connection) Widget.HandleBrowserHostMessage(Type, Payload);
+			});
+		});
 		FVeloCEFConnectionConfig Config;
 		Config.InitialSize = InitialSize.X > 0 && InitialSize.Y > 0 ? InitialSize : FIntPoint(1920, 1080);
 		Config.InitialURL = InitialURL;
+		Config.bEnableJavaScript = bEnableJavaScript;
 		Config.bAllowMediaCapture = bAllowMediaCapture;
 		Config.bEnablePixelStreaming = bEnablePixelStreaming;
 		if (!CEFConnection->Start(Config))
@@ -529,8 +588,25 @@ void UVeloWebView::RefreshHostIframe()
 
 void UVeloWebView::SetJavaScriptEnabled(bool bEnabled)
 {
+	const bool bWasEnabled = bEnableJavaScript;
+	if (!bEnabled)
+	{
+		const bool bWasBridgeReady = bJavaScriptBridgeReady;
+		const FString PreviousSession = JavaScriptBridgeSession;
+		ResetJavaScriptBridge(TEXT("JavaScript was disabled."));
+		bJavaScriptBridgeReady = bWasBridgeReady;
+		JavaScriptBridgeSession = PreviousSession;
+	}
 	bEnableJavaScript = bEnabled;
+#if PLATFORM_WINDOWS
+	if (RenderMode == EVeloWebViewRenderMode::Composited && CEFConnection.IsValid())
+	{
+		CEFConnection->SetJavaScriptEnabled(bEnabled);
+	}
+	else
+#endif
 	QueueOrExecute([bEnabled](IVeloWebViewPlatform& Native) { Native.SetJavaScriptEnabled(bEnabled); });
+	if (bEnabled && !bWasEnabled && bJavaScriptBridgeReady) OnJavaScriptBridgeReady.Broadcast();
 }
 
 void UVeloWebView::SetMediaAutoplay(bool bEnabled)
@@ -755,6 +831,9 @@ TSharedRef<SWidget> UVeloWebView::RebuildWidget()
 
 void UVeloWebView::ReleaseSlateResources(bool bReleaseChildren)
 {
+	ResetJavaScriptBridge(TEXT("WebView resources were released."));
+	FTSTicker::GetCoreTicker().RemoveTicker(JavaScriptTicker);
+	JavaScriptTicker.Reset();
 	if (Platform.IsValid())
 	{
 		Platform->Shutdown();
@@ -801,6 +880,9 @@ void UVeloWebView::SynchronizeProperties()
 
 void UVeloWebView::BeginDestroy()
 {
+	ResetJavaScriptBridge(TEXT("WebView was destroyed."));
+	FTSTicker::GetCoreTicker().RemoveTicker(JavaScriptTicker);
+	JavaScriptTicker.Reset();
 	if (Platform.IsValid())
 	{
 		Platform->Shutdown();
@@ -818,19 +900,20 @@ void UVeloWebView::BeginDestroy()
 	Super::BeginDestroy();
 }
 
-void UVeloWebView::HandlePageStarted(const FString& URL) { OnPageStarted.Broadcast(URL); }
+void UVeloWebView::HandlePageStarted(const FString& URL)
+{
+	ResetJavaScriptBridge(TEXT("WebView navigated to another document."));
+	OnPageStarted.Broadcast(URL);
+}
 void UVeloWebView::HandlePageLoaded(const FString& URL) { OnPageLoaded.Broadcast(URL); }
 void UVeloWebView::HandlePageError(const FVeloWebViewError& Error) { OnPageError.Broadcast(Error); }
 void UVeloWebView::HandleURLChanged(const FString& URL) { OnURLChanged.Broadcast(URL); }
 void UVeloWebView::HandleTitleChanged(const FString& Title) { OnTitleChanged.Broadcast(Title); }
-void UVeloWebView::HandleJavaScriptMessage(const FString& Message)
+void UVeloWebView::HandleConsoleMessage(const FString& Message, const FString& Source, int32 Line)
 {
-#if !UE_BUILD_SHIPPING
-	UE_LOG(LogVeloWebView, Display, TEXT("JavaScript message: %s"), *Message);
-#endif
-	OnJavaScriptMessage.Broadcast(Message);
+	UE_LOG(LogVeloWebView, Verbose, TEXT("Browser console: %s"), *Message);
+	OnConsoleMessage.Broadcast(Message, Source, Line);
 }
-void UVeloWebView::HandleConsoleMessage(const FString& Message, const FString& Source, int32 Line) { OnConsoleMessage.Broadcast(Message, Source, Line); }
 void UVeloWebView::HandleDownloadRequested(const FString& URL, const FString& SuggestedFilename, const FString& MimeType) { OnDownloadRequested.Broadcast(URL, SuggestedFilename, MimeType); }
 void UVeloWebView::HandlePermissionRequested(EVeloWebViewPermission Permission, const FString& Origin) { OnPermissionRequested.Broadcast(Permission, Origin); }
 void UVeloWebView::HandleFullscreenChanged(bool bIsFullscreen) { OnFullscreenChanged.Broadcast(bIsFullscreen); }
@@ -839,9 +922,6 @@ void UVeloWebView::HandleNewWindowRequested(const FString& URL, bool bIsUserInit
 
 void UVeloWebViewScriptBridge::PostMessage(const FString& Message)
 {
-	#if !UE_BUILD_SHIPPING
-	if (Message == TEXT("VeloLayerTest")) UE_LOG(LogVeloWebView, Display, TEXT("Layer test JavaScript bridge received"));
-	#endif
 	const TWeakObjectPtr<UVeloWebView> WeakOwner = Owner;
 	VeloWebViewPrivate::DispatchToGameThread(WeakOwner, [Message](UVeloWebView& Widget)
 	{

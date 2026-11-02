@@ -17,6 +17,7 @@
 #include "Widgets/Images/SImage.h"
 #include "Engine/Texture2D.h"
 #include "BrowserProtocol/BrowserProtocol.h"
+#include "JavaScriptBridge/BridgeScript.h"
 
 namespace
 {
@@ -126,18 +127,16 @@ namespace
 
 	void InstallCompositedBridge(UVeloWebView& View)
 	{
-		FString Script = TEXT("(function(){window.VeloWebView=window.VeloWebView||{};"
-			"window.VeloWebView.postMessage=function(m){if(window.ue&&window.ue.velobridge){window.ue.velobridge.postmessage(String(m));}};");
+		FString Script = UTF8_TO_TCHAR(VeloWebView::JavaScriptBridgeSource);
 #if PLATFORM_ANDROID
-		Script += TEXT("if(!window.__VeloPopupInterceptor){window.__VeloPopupInterceptor=true;"
+		Script += TEXT("(function(){if(!window.__VeloPopupInterceptor){window.__VeloPopupInterceptor=true;"
 			"window.VeloWebView.__open=function(url,user){try{var target=new URL(String(url),location.href).href;"
 			"window.VeloWebView.postMessage('__VELO_NEW_WINDOW__'+(user?'1':'0')+target);}catch(e){}};"
 			"window.open=function(url){if(url)window.VeloWebView.__open(url,!!(navigator.userActivation&&navigator.userActivation.isActive));return null;};"
 			"document.addEventListener('click',function(e){var a=e.target&&e.target.closest&&e.target.closest('a[target]');"
 			"if(a&&a.target&&a.target.toLowerCase()!=='_self'&&a.target.toLowerCase()!=='_top'&&a.target.toLowerCase()!=='_parent'){"
-			"e.preventDefault();window.VeloWebView.__open(a.href,true);}},true);}");
+			"e.preventDefault();window.VeloWebView.__open(a.href,true);}},true);}})();");
 #endif
-		Script += TEXT("})();");
 		View.ExecuteJavaScript(Script);
 	}
 
@@ -317,6 +316,8 @@ void SVeloWebView::Tick(const FGeometry& AllottedGeometry, const double InCurren
 		{
 			// Recreate the host when a window grows beyond the fixed shared-memory
 			// allocation. Pending URL/HTML state is retained and replayed below.
+			Widget->ResetJavaScriptBridge(TEXT("WebView browser was recreated for a larger viewport."));
+			Widget->CompositedTextureSequence = 0;
 			Widget->CEFConnection->Stop();
 			Widget->CEFConnection.Reset();
 			bLastCEFConnected = false;

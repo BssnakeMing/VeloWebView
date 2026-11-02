@@ -23,5 +23,14 @@ explicit CPU `OnPaint` fallback through a three-slot ring, which makes the
 process/IPC milestone testable on machines without a working CEF GPU adapter.
 The fallback is not the intended 60 FPS production path.
 
+The current Windows widget defaults to the CPU ring. BrowserHost caches the
+clean `PET_VIEW` image and the independent `PET_POPUP` image used by native
+HTML select dropdowns. It alpha-composites the popup into a full view-sized
+BGRA frame before publishing, so Slate needs no extra popup widget or IPC
+message. Closing a popup republishes the clean view immediately; resizing and
+main-frame navigation discard stale popup state. Popups are kept inside the
+virtual browser screen, with the same position adjustment applied to mouse
+move, click and wheel events.
+
 All names include the per-widget instance id. A dead host is treated as an
 input/IPC error and reported to the widget; it never terminates the UE process.

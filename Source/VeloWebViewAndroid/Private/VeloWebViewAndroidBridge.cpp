@@ -1,4 +1,5 @@
 #include "VeloWebViewAndroidBridge.h"
+#include "JavaScriptBridge/BridgeScript.h"
 
 #include "Async/Async.h"
 
@@ -186,6 +187,13 @@ int32 FVeloWebViewAndroidBridge::CreateInstance(int32 RequestedId, bool bEnableJ
 	}
 	FJavaWrapper::CallStaticVoidMethod(Env, Clazz, Initialize, FJavaWrapper::GameActivityThis);
 	ClearJavaException(Env);
+	jmethodID SetBridge = FindStatic(Env, "setJavaScriptBridgeSource", "(Ljava/lang/String;)V");
+	if (SetBridge != nullptr)
+	{
+		auto JavaSource = FJavaHelper::ToJavaString(Env, UTF8_TO_TCHAR(VeloWebView::JavaScriptBridgeSource));
+		FJavaWrapper::CallStaticVoidMethod(Env, Clazz, SetBridge, *JavaSource);
+		ClearJavaException(Env);
+	}
 
 	jmethodID Method = FindStatic(Env, "create", "(IZZZZZLjava/lang/String;)I");
 	if (Method == nullptr)

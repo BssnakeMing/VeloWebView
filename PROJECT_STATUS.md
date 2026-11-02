@@ -12,6 +12,9 @@
   uploads BGRA frames to a transient Slate texture. `--allow-media-capture` is
   available for trusted WebRTC pages and `--enable-pixel-streaming` controls
   autoplay/background throttling.
+- Added CEF renderer-to-browser JS messages, browser-to-UE pipe events and a
+  shared CEF/WebView2/Android bridge with named Promise requests, Blueprint
+  replies, JavaScript results, native page events, timeouts and document sessions.
 
 ## In progress
 
@@ -23,7 +26,7 @@
 - Host-owned D3D11 texture ring and named GPU-handle transport (the current
   host publishes accelerated-frame metadata but does not yet copy CEF's
   transient handle into a cross-process GPU ring).
-- Full IME/keyboard composition, JS allow-list request/response, popup texture,
+- Full IME/keyboard composition, application-specific request handlers,
   devtools and shipping staging tests.
 - Standalone Consumer.exe and automated milestone tests.
 
